@@ -132,10 +132,6 @@ const PACKAGE_DIP_PATH: &str = "/usr/share/kicad/footprints/Package_DIP.pretty/"
 /// Single footprint to load when directory load fails (any .kicad_mod name).
 const FALLBACK_FOOTPRINT: &str = "DIP-4_W7.62mm";
 
-/// Half-size of the grab rect around the DIP package (mm), for hit-test when dragging.
-/// Use a square large enough to contain the footprint at any rotation (0°: ~8×15, so max 15).
-const DIP_GRAB_RECT_HALF_MM: f32 = 16.0;
-
 struct CanvasApp {
     pan: egui::Vec2,
     zoom: f32,
@@ -369,19 +365,20 @@ impl eframe::App for CanvasApp {
                     (pos.y - origin.y - self.pan.y) / scale,
                 )
             });
-            let package_rect_min = egui::vec2(
-                dip_pos_mm.x - DIP_GRAB_RECT_HALF_MM,
-                dip_pos_mm.y - DIP_GRAB_RECT_HALF_MM,
-            );
-            let package_rect_max = egui::vec2(
-                dip_pos_mm.x + DIP_GRAB_RECT_HALF_MM,
-                dip_pos_mm.y + DIP_GRAB_RECT_HALF_MM,
-            );
             let package_visible = self.dip_lib.is_some();
             let pointer_over_package = package_visible
                 && pointer_mm.map_or(false, |p| {
-                    p.x >= package_rect_min.x && p.x <= package_rect_max.x
-                        && p.y >= package_rect_min.y && p.y <= package_rect_max.y
+                    self.dip_lib.as_ref().map_or(false, |lib| {
+                        lib.iter().next().map_or(false, |(_name, fp)| {
+                            let bounds = footprint::footprint_bounds_local(fp);
+                            footprint::point_in_footprint_bounds(
+                                p.x, p.y,
+                                dip_pos_mm.x, dip_pos_mm.y,
+                                self.dip_rotation_deg as f64,
+                                bounds,
+                            )
+                        })
+                    })
                 });
 
             if response.dragged_by(egui::PointerButton::Primary) {

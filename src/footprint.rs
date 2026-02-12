@@ -262,9 +262,46 @@ fn drill_diameter(drill: &crate::kicad9::Drill) -> f32 {
 /// Margin (mm) added to footprint bounds for the body fill polygon.
 const BODY_BOUNDS_MARGIN_MM: f32 = 0.5;
 
+/// Transform a point from board/world coordinates to footprint-local (inverse of transform_point).
+#[inline]
+fn transform_point_inverse(
+    world_x: f32,
+    world_y: f32,
+    cx: f32,
+    cy: f32,
+    rot_deg: f64,
+) -> (f32, f32) {
+    let dx = world_x - cx;
+    let dy = world_y - cy;
+    let rad = rot_deg.to_radians();
+    let cos = rad.cos() as f32;
+    let sin = rad.sin() as f32;
+    let lx = dx * cos - dy * sin;
+    let ly = -dx * sin - dy * cos;
+    (lx, ly)
+}
+
+/// Returns true if (world_x, world_y) is inside the footprint's bounding box when the footprint
+/// is at (cx, cy) with rotation rot_deg. Use for grab hit-testing.
+pub fn point_in_footprint_bounds(
+    world_x: f32,
+    world_y: f32,
+    cx: f32,
+    cy: f32,
+    rot_deg: f64,
+    local_bounds: Option<(f32, f32, f32, f32)>,
+) -> bool {
+    let (lox, loy, hix, hiy) = match local_bounds {
+        Some(b) => b,
+        None => return false,
+    };
+    let (lx, ly) = transform_point_inverse(world_x, world_y, cx, cy, rot_deg);
+    lx >= lox && lx <= hix && ly >= loy && ly <= hiy
+}
+
 /// Compute axis-aligned bounding box of the footprint in local coordinates (min_x, min_y, max_x, max_y).
 /// Used to draw a semi-transparent body fill under the outline.
-fn footprint_bounds_local(fp: &Footprint) -> Option<(f32, f32, f32, f32)> {
+pub fn footprint_bounds_local(fp: &Footprint) -> Option<(f32, f32, f32, f32)> {
     let mut min_x = f32::MAX;
     let mut min_y = f32::MAX;
     let mut max_x = f32::MIN;

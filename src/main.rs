@@ -1,8 +1,16 @@
+use std::collections::HashMap;
+use std::path::Path;
+
 use eframe::egui;
+use walkdir::WalkDir;
+use crate::kicad9::Footprint;
+
+mod footprint;
+mod kicad9;
 
 // --- PCB constants (mm), matching protomatrix.py ---
-const PROTO_AREA: (i32, i32) = (200, 6);
-const MATRIX_SIZE: i32 = 30;
+const PROTO_AREA: (i32, i32) = (60, 6);
+const MATRIX_SIZE: i32 = 15;
 const MATRIX_BREAK_EVERY: i32 = 10;
 const MATRIX_BREAK_SIZE_MM: f32 = 0.508;   // 20 mil
 const PROTO_PITCH_MM: f32 = 2.54;           // 100 mil
@@ -90,7 +98,20 @@ const SOLDER_JUMPER_LEFT_HALF_MM: &[(f32, f32)] = &[
 ];
 
 fn main() -> eframe::Result<()> {
-    let native_options = eframe::NativeOptions::default();
+    if std::env::args().any(|a| a == "--check-footprints") {
+        check_footprints();
+        return Ok(());
+    }
+
+    let path = Path::new("/usr/share/kicad/footprints/Package_DIP.pretty/DIP-10_W10.16mm.kicad_mod");
+    let _f1 = footprint::load_footprint(path);
+
+    let native_options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1200.0, 800.0]),
+        ..Default::default()
+    };
+
     eframe::run_native(
         "Proto Matrix PCB",
         native_options,
@@ -103,18 +124,174 @@ const ZOOM_MAX: f32 = 25.0;
 /// Scroll-to-zoom: scale factor per point of smooth scroll (reduces stutter vs raw_scroll_delta).
 const ZOOM_SENSITIVITY: f32 = 0.0008;
 
+/// Loaded Package_DIP library; one footprint is drawn for demo.
+const PACKAGE_DIP_PATH: &str = "/usr/share/kicad/footprints/Package_DIP.pretty/";
+//const PACKAGE_DIP_PATH: &str = "/usr/share/kicad/footprints/Resistor_THT.pretty";
+
+
+/// Single footprint to load when directory load fails (any .kicad_mod name).
+const FALLBACK_FOOTPRINT: &str = "DIP-4_W7.62mm";
+
+/// Half-size of the grab rect around the DIP package (mm), for hit-test when dragging.
+/// Use a square large enough to contain the footprint at any rotation (0°: ~8×15, so max 15).
+const DIP_GRAB_RECT_HALF_MM: f32 = 16.0;
+
 struct CanvasApp {
     pan: egui::Vec2,
     zoom: f32,
+    /// Loaded footprints from Package_DIP (name -> Footprint).
+    dip_lib: Option<HashMap<String, Footprint>>,
+    /// Package position in mm. None = use default (to the right of board).
+    dip_pos_mm: Option<egui::Vec2>,
+    /// Package rotation in degrees (counterclockwise). 0 = default orientation.
+    dip_rotation_deg: f32,
+    /// True while left-dragging the package (so we keep moving it until release).
+    dragging_package: bool,
 }
 
 impl CanvasApp {
     fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+        let dip_lib = load_package_dip();
+        if let Some(ref lib) = dip_lib {
+            print_footprint_info(lib);
+        } else {
+            println!("[footprint] no library loaded from {}", PACKAGE_DIP_PATH);
+        }
         Self {
             pan: egui::Vec2::ZERO,
             zoom: 1.0,
+            dip_lib,
+            dip_pos_mm: None,
+            dip_rotation_deg: 0.0,
+            dragging_package: false,
         }
     }
+}
+
+/// Print summary of loaded footprint library and the first footprint (the one we draw).
+fn print_footprint_info(lib: &HashMap<String, Footprint>) {
+    println!("[footprint] loaded {} footprint(s) from {}", lib.len(), PACKAGE_DIP_PATH);
+    if let Some((name, fp)) = lib.iter().next() {
+        let pad_count = fp.pads().count();
+        let graphic_count = fp.graphics().count();
+        println!(
+            "[footprint] drawing '{}': elements={} pads={} graphics={}",
+            name,
+            fp.elements.len(),
+            pad_count,
+            graphic_count
+        );
+    }
+}
+
+/// Load Package_DIP footprint library from system path.
+fn load_package_dip() -> Option<HashMap<String, Footprint>> {
+    let mut candidates: Vec<std::path::PathBuf> = vec![
+        PACKAGE_DIP_PATH.into(),
+        "/usr/share/kicad/footprints".into(),
+    ];
+    if let Ok(env_path) = std::env::var("KICAD_FOOTPRINTS") {
+        candidates.insert(0, Path::new(&env_path).join("Package_DIP.pretty"));
+    }
+    for path in candidates {
+        match footprint::load_footprint_dir(&path) {
+            Ok(lib) if !lib.is_empty() => {
+                println!("[footprint] loaded from {}", path.display());
+                return Some(lib);
+            }
+            Ok(_) => {
+                println!("[footprint] dir empty: {}", path.display());
+            }
+            Err(e) => {
+                println!("[footprint] dir failed {}: {}", path.display(), e);
+            }
+        }
+        // Fallback: load one footprint from this candidate.
+        let single = path.join(format!("{}.kicad_mod", FALLBACK_FOOTPRINT));
+        if let Ok(module) = footprint::load_footprint(&single) {
+            println!("[footprint] loaded single from {}", single.display());
+            let mut map = HashMap::new();
+            map.insert(module.name.clone(), module);
+            return Some(map);
+        }
+    }
+    None
+}
+
+/// Run footprint parse check: walk /usr/share/kicad/footprints, try to parse each .kicad_mod,
+/// report errors grouped by unknown element type. Run with: cargo run -- --check-footprints
+fn check_footprints() {
+    let root = Path::new("/usr/share/kicad/footprints");
+    if !root.exists() {
+        eprintln!("footprints dir not found: {}", root.display());
+        return;
+    }
+
+    let mut ok = 0u64;
+    let mut fail = 0u64;
+    let mut errors: HashMap<String, Vec<(String, String)>> = HashMap::new();
+
+    for entry in WalkDir::new(root).follow_links(true).max_depth(2) {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("walk error: {}", e);
+                continue;
+            }
+        };
+        let path = entry.path();
+        if path.is_file()
+            && path
+                .extension()
+                .and_then(std::ffi::OsStr::to_str)
+                .map_or(false, |e| e == "kicad_mod")
+        {
+            match footprint::load_footprint(path) {
+                Ok(_fp) => ok += 1,
+                Err(e) => {
+                    fail += 1;
+                    let err_str = format!("{:?}", e);
+                    let key = extract_unknown_element(&err_str)
+                        .map(String::from)
+                        .unwrap_or_else(|| "other".to_string());
+                    errors.entry(key).or_default().push((
+                        path.display().to_string(),
+                        err_str,
+                    ));
+                }
+            }
+        }
+    }
+
+    println!("Parse results:");
+    println!("  OK: {}", ok);
+    println!("  Fail: {}", fail);
+    if !errors.is_empty() {
+        println!("\nErrors by type:");
+        let mut keys: Vec<_> = errors.keys().collect();
+        keys.sort();
+        for key in keys {
+            let v = &errors[key];
+            println!("  {} ({} files):", key, v.len());
+            for (path, err) in v.iter().take(3) {
+                println!("    {} -> {}", path, err);
+            }
+            if v.len() > 3 {
+                println!("    ... and {} more", v.len() - 3);
+            }
+        }
+    }
+}
+
+fn extract_unknown_element(err: &str) -> Option<&str> {
+    let prefix = "unknown element in module: ";
+    if let Some(start) = err.find(prefix) {
+        let rest = &err[start + prefix.len()..];
+        if let Some(end) = rest.find('"') {
+            return Some(rest[..end].trim());
+        }
+    }
+    None
 }
 
 impl eframe::App for CanvasApp {
@@ -136,6 +313,14 @@ impl eframe::App for CanvasApp {
 
             let sense = egui::Sense::drag().union(egui::Sense::hover());
             let response = ui.allocate_rect(rect, sense);
+
+            if ui.input(|i| i.pointer.primary_released()) {
+                self.dragging_package = false;
+            }
+
+            if self.dip_lib.is_some() && ui.input(|i| i.key_pressed(egui::Key::R)) {
+                self.dip_rotation_deg = (self.dip_rotation_deg + 90.0).rem_euclid(360.0);
+            }
 
             // Pan: middle or right mouse drag (round to pixel to avoid sub-pixel jitter)
             if response.dragged_by(egui::PointerButton::Middle)
@@ -174,6 +359,45 @@ impl eframe::App for CanvasApp {
             let scale = base_scale * self.zoom;
             let origin = rect.center() - board_center_mm * scale;
 
+            let default_dip_mm = egui::vec2(x_max + 18.0, 0.0);
+            let dip_pos_mm = self.dip_pos_mm.unwrap_or(default_dip_mm);
+
+            // Pointer position in world mm (for package grab hit-test)
+            let pointer_mm = response.hover_pos().map(|pos| {
+                egui::vec2(
+                    (pos.x - origin.x - self.pan.x) / scale,
+                    (pos.y - origin.y - self.pan.y) / scale,
+                )
+            });
+            let package_rect_min = egui::vec2(
+                dip_pos_mm.x - DIP_GRAB_RECT_HALF_MM,
+                dip_pos_mm.y - DIP_GRAB_RECT_HALF_MM,
+            );
+            let package_rect_max = egui::vec2(
+                dip_pos_mm.x + DIP_GRAB_RECT_HALF_MM,
+                dip_pos_mm.y + DIP_GRAB_RECT_HALF_MM,
+            );
+            let package_visible = self.dip_lib.is_some();
+            let pointer_over_package = package_visible
+                && pointer_mm.map_or(false, |p| {
+                    p.x >= package_rect_min.x && p.x <= package_rect_max.x
+                        && p.y >= package_rect_min.y && p.y <= package_rect_max.y
+                });
+
+            if response.dragged_by(egui::PointerButton::Primary) {
+                let delta = response.drag_delta();
+                let delta_mm = egui::vec2(delta.x / scale, delta.y / scale);
+                if (self.dragging_package || pointer_over_package) && package_visible {
+                    if !self.dragging_package {
+                        self.dip_pos_mm = Some(dip_pos_mm);
+                        self.dragging_package = true;
+                    }
+                    if let Some(ref mut pos) = self.dip_pos_mm {
+                        *pos += delta_mm;
+                    }
+                }
+            }
+
             let to_screen = |x_mm: f32, y_mm: f32| -> egui::Pos2 {
                 let v = origin + self.pan + egui::vec2(x_mm * scale, y_mm * scale);
                 egui::pos2(v.x, v.y)
@@ -201,11 +425,36 @@ impl eframe::App for CanvasApp {
             draw_y_link_vias(&painter, &to_screen, scale, view);
             draw_mounting_holes(&painter, &to_screen, scale, view);
 
-            if response.hovered() {
-                ctx.set_cursor_icon(egui::CursorIcon::Grab);
+            // Draw one footprint (any from the library); position is draggable.
+            if let Some(ref lib) = self.dip_lib {
+                if let Some((_name, fp)) = lib.iter().next() {
+                    let view_dip = (
+                        view.0,
+                        view.1.max(dip_pos_mm.x + 25.0),
+                        view.2.min(dip_pos_mm.y - 12.0),
+                        view.3.max(dip_pos_mm.y + 12.0),
+                    );
+                    footprint::draw_footprint(
+                        &painter,
+                        &to_screen,
+                        scale,
+                        view_dip,
+                        fp,
+                        dip_pos_mm.x,
+                        dip_pos_mm.y,
+                        self.dip_rotation_deg as f64,
+                    );
+                }
             }
-            if response.dragged() {
+
+            if self.dragging_package {
                 ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+            } else if pointer_over_package {
+                ctx.set_cursor_icon(egui::CursorIcon::Grab);
+            } else if response.dragged() {
+                ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+            } else if response.hovered() {
+                ctx.set_cursor_icon(egui::CursorIcon::Grab);
             }
         });
     }

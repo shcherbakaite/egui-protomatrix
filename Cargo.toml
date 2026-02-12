@@ -6,3 +6,4 @@ edition = "2021"
 [dependencies]
 eframe = "0.33"
 egui = "0.33"
+walkdir = "2"

@@ -1,0 +1,517 @@
+{
+  "config": {
+    "proto_area": [
+      63,
+      5
+    ],
+    "matrix_size": 15,
+    "matrix_break_every": 5,
+    "matrix_break_size_mm": 0.508,
+    "proto_pitch_mm": 2.54,
+    "matrix_v_pitch_mm": 1.016,
+    "proto_gap_mm": 7.62,
+    "track_width_mm": 0.5,
+    "jumper_track_offset_x_mm": 0.381,
+    "offset_100mil_mm": 2.54,
+    "offset_50mil_mm": 1.27,
+    "offset_30mil_mm": 0.762,
+    "proto_pad_dia_mm": 1.9,
+    "proto_pad_hole_mm": 1.2,
+    "via_drill_mm": 0.3,
+    "via_dia_mm": 0.5,
+    "jumper_pad_mm": 0.635,
+    "mounting_hole_mm": 3.2
+  },
+  "connections": [
+    {
+      "a": {
+        "Pad": {
+          "side": "Upper",
+          "col": 60,
+          "row": 4
+        }
+      },
+      "b": {
+        "Pad": {
+          "side": "Upper",
+          "col": 60,
+          "row": 0
+        }
+      }
+    },
+    {
+      "a": {
+        "Pad": {
+          "side": "Lower",
+          "col": 60,
+          "row": 0
+        }
+      },
+      "b": {
+        "Pad": {
+          "side": "Lower",
+          "col": 60,
+          "row": 4
+        }
+      }
+    },
+    {
+      "a": {
+        "Pad": {
+          "side": "Lower",
+          "col": 59,
+          "row": 0
+        }
+      },
+      "b": {
+        "Pad": {
+          "side": "Lower",
+          "col": 59,
+          "row": 4
+        }
+      }
+    },
+    {
+      "a": {
+        "Pad": {
+          "side": "Lower",
+          "col": 59,
+          "row": 0
+        }
+      },
+      "b": {
+        "Pad": {
+          "side": "Upper",
+          "col": 59,
+          "row": 0
+        }
+      }
+    },
+    {
+      "a": {
+        "Pad": {
+          "side": "Lower",
+          "col": 59,
+          "row": 0
+        }
+      },
+      "b": {
+        "Pad": {
+          "side": "Upper",
+          "col": 38,
+          "row": 4
+        }
+      }
+    },
+    {
+      "a": {
+        "Pad": {
+          "side": "Lower",
+          "col": 47,
+          "row": 3
+        }
+      },
+      "b": {
+        "Pad": {
+          "side": "Upper",
+          "col": 40,
+          "row": 4
+        }
+      }
+    },
+    {
+      "a": {
+        "Pad": {
+          "side": "Upper",
+          "col": 41,
+          "row": 4
+        }
+      },
+      "b": {
+        "Pad": {
+          "side": "Lower",
+          "col": 50,
+          "row": 3
+        }
+      }
+    },
+    {
+      "a": {
+        "Pad": {
+          "side": "Upper",
+          "col": 38,
+          "row": 4
+        }
+      },
+      "b": {
+        "Pad": {
+          "side": "Upper",
+          "col": 13,
+          "row": 4
+        }
+      }
+    },
+    {
+      "a": {
+        "Pad": {
+          "side": "Lower",
+          "col": 60,
+          "row": 0
+        }
+      },
+      "b": {
+        "Pad": {
+          "side": "Upper",
+          "col": 14,
+          "row": 4
+        }
+      }
+    },
+    {
+      "a": {
+        "Pad": {
+          "side": "Lower",
+          "col": 50,
+          "row": 0
+        }
+      },
+      "b": {
+        "Pad": {
+          "side": "Upper",
+          "col": 15,
+          "row": 4
+        }
+      }
+    },
+    {
+      "a": {
+        "Pad": {
+          "side": "Lower",
+          "col": 47,
+          "row": 0
+        }
+      },
+      "b": {
+        "Pad": {
+          "side": "Upper",
+          "col": 16,
+          "row": 4
+        }
+      }
+    },
+    {
+      "a": {
+        "Pad": {
+          "side": "Lower",
+          "col": 59,
+          "row": 0
+        }
+      },
+      "b": {
+        "Pad": {
+          "side": "Upper",
+          "col": 17,
+          "row": 4
+        }
+      }
+    },
+    {
+      "a": {
+        "Pad": {
+          "side": "Upper",
+          "col": 14,
+          "row": 4
+        }
+      },
+      "b": {
+        "Pad": {
+          "side": "Upper",
+          "col": 18,
+          "row": 4
+        }
+      }
+    },
+    {
+      "a": {
+        "Pad": {
+          "side": "Lower",
+          "col": 5,
+          "row": 4
+        }
+      },
+      "b": {
+        "Pad": {
+          "side": "Upper",
+          "col": 1,
+          "row": 0
+        }
+      }
+    },
+    {
+      "a": {
+        "Pad": {
+          "side": "Upper",
+          "col": 17,
+          "row": 4
+        }
+      },
+      "b": {
+        "Pad": {
+          "side": "Lower",
+          "col": 4,
+          "row": 0
+        }
+      }
+    },
+    {
+      "a": {
+        "Pad": {
+          "side": "Upper",
+          "col": 3,
+          "row": 0
+        }
+      },
+      "b": {
+        "Pad": {
+          "side": "Lower",
+          "col": 13,
+          "row": 3
+        }
+      }
+    },
+    {
+      "a": {
+        "Pad": {
+          "side": "Upper",
+          "col": 17,
+          "row": 0
+        }
+      },
+      "b": {
+        "Pad": {
+          "side": "Lower",
+          "col": 14,
+          "row": 0
+        }
+      }
+    },
+    {
+      "a": {
+        "Pad": {
+          "side": "Upper",
+          "col": 17,
+          "row": 0
+        }
+      },
+      "b": {
+        "Pad": {
+          "side": "Lower",
+          "col": 17,
+          "row": 0
+        }
+      }
+    },
+    {
+      "a": {
+        "Pad": {
+          "side": "Lower",
+          "col": 18,
+          "row": 0
+        }
+      },
+      "b": {
+        "Pad": {
+          "side": "Upper",
+          "col": 60,
+          "row": 4
+        }
+      }
+    },
+    {
+      "a": {
+        "Pad": {
+          "side": "Lower",
+          "col": 60,
+          "row": 0
+        }
+      },
+      "b": {
+        "Pad": {
+          "side": "Upper",
+          "col": 39,
+          "row": 4
+        }
+      }
+    },
+    {
+      "a": {
+        "Pad": {
+          "side": "Lower",
+          "col": 21,
+          "row": 4
+        }
+      },
+      "b": {
+        "Pad": {
+          "side": "Lower",
+          "col": 43,
+          "row": 4
+        }
+      }
+    }
+  ],
+  "net_names": {
+    "L4": "GND",
+    "L60": "3.3V",
+    "L13": "SW_OUT",
+    "L33": "3.3V",
+    "L18": "5V",
+    "U16": "SDA",
+    "L47": "SCL",
+    "L50": "SDA",
+    "L1": "BAT+",
+    "L5": "SW_IN"
+  },
+  "net_colors": {
+    "L1": [
+      255,
+      233,
+      96,
+      255
+    ],
+    "L18": [
+      161,
+      0,
+      255,
+      255
+    ],
+    "L50": [
+      96,
+      255,
+      136,
+      255
+    ],
+    "L5": [
+      67,
+      12,
+      134,
+      255
+    ],
+    "L60": [
+      255,
+      0,
+      0,
+      255
+    ],
+    "L47": [
+      253,
+      254,
+      255,
+      255
+    ],
+    "L33": [
+      255,
+      0,
+      0,
+      255
+    ],
+    "L4": [
+      0,
+      109,
+      255,
+      255
+    ],
+    "U16": [
+      64,
+      255,
+      71,
+      255
+    ]
+  },
+  "net_row_pins": {
+    "L60": 2,
+    "L4": 14,
+    "L13": 9,
+    "L18": 8,
+    "L5": 10
+  },
+  "annotations": [
+    {
+      "pos_mm": [
+        38.923927,
+        -2.8543408
+      ],
+      "text": "5V BOOST CONVERTER"
+    },
+    {
+      "pos_mm": [
+        7.206836,
+        -2.777137
+      ],
+      "text": "CHARGE CONTROLLER"
+    },
+    {
+      "pos_mm": [
+        39.07605,
+        -5.758524
+      ],
+      "text": "BMP280"
+    },
+    {
+      "pos_mm": [
+        51.34094,
+        -44.665268
+      ],
+      "text": ""
+    },
+    {
+      "pos_mm": [
+        7.9626493,
+        -2.5734212
+      ],
+      "text": ""
+    },
+    {
+      "pos_mm": [
+        5.0767245,
+        -6.073786
+      ],
+      "text": "SWITCH"
+    },
+    {
+      "pos_mm": [
+        100.1429,
+        -5.75434
+      ],
+      "text": "OLED"
+    },
+    {
+      "pos_mm": [
+        134.91711,
+        -4.338512
+      ],
+      "text": "ESP32"
+    }
+  ],
+  "column_annotations": {
+    "L2": "STAT1",
+    "U14": "CSB",
+    "L17": "GND",
+    "L15": "EN",
+    "L18": "5V",
+    "L14": "GND",
+    "U3": "SW2",
+    "U13": "SDO",
+    "L4": "LOAD-",
+    "L0": "BAT-",
+    "L16": "LB",
+    "U1": "SW1",
+    "L13": "BAT",
+    "U15": "I2C",
+    "L5": "LOAD+",
+    "L3": "STAT2",
+    "L1": "BAT+",
+    "U16": "I2C",
+    "L21": "BTN_LEFT"
+  }
+}

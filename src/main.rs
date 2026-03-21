@@ -399,7 +399,7 @@ impl CanvasApp {
             set_size_proto_cols: 63,
             set_size_proto_rows: 5,
             set_size_matrix_size: 15,
-            set_size_break_every: 10,
+            set_size_break_every: 5,
             set_size_apply_clicked: false,
             annotations: Vec::new(),
             column_annotations: HashMap::new(),
@@ -785,6 +785,10 @@ fn net_index_for_target(
     }
 }
 
+fn row_to_y_label(row: i32) -> String {
+    format!("Y{}", row + 1)
+}
+
 fn protomatrix_target_label(t: &ProtomatrixTarget) -> String {
     let side = |s: ProtoSide| match s {
         ProtoSide::Upper => "upper",
@@ -792,13 +796,13 @@ fn protomatrix_target_label(t: &ProtomatrixTarget) -> String {
     };
     match t {
         ProtomatrixTarget::Pad { side: s, col, row } => {
-            format!("pad {} (row {})", column_key_to_x_label(&ColumnKey { side: *s, col: *col }), row)
+            format!("pad {} ({})", column_key_to_x_label(&ColumnKey { side: *s, col: *col }), row_to_y_label(*row))
         }
         ProtomatrixTarget::MatrixRow { side: s, row } => {
-            format!("matrix row {} [{}]", row, side(*s))
+            format!("matrix {} [{}]", row_to_y_label(*row), side(*s))
         }
         ProtomatrixTarget::SolderJumper { side: s, col, row } => {
-            format!("jumper {} row {} [{}]", column_key_to_x_label(&ColumnKey { side: *s, col: *col }), row, side(*s))
+            format!("jumper {} {} [{}]", column_key_to_x_label(&ColumnKey { side: *s, col: *col }), row_to_y_label(*row), side(*s))
         }
     }
 }

@@ -52,7 +52,7 @@ impl Default for ProtomatrixConfig {
         Self {
             proto_area: (63, 5),
             matrix_size: 15,
-            matrix_break_every: 10,
+            matrix_break_every: 5,
             matrix_break_size_mm: 0.508,
             proto_pitch_mm: 2.54,
             matrix_v_pitch_mm: 1.016,
@@ -75,7 +75,7 @@ impl Default for ProtomatrixConfig {
 impl ProtomatrixConfig {
     fn matrix_gradient(&self, _i: i32, j: i32) -> (f32, f32) {
         let mut dy = self.matrix_v_pitch_mm;
-        if (j % self.matrix_break_every) == 0 && j != 0 {
+        if (j + 1) % self.matrix_break_every == 0 && j > 0 {
             dy += self.matrix_break_size_mm;
         }
         (self.proto_pitch_mm, dy)

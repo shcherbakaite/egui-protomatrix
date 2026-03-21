@@ -894,11 +894,11 @@ version = "0.1.0"
 dependencies = [
  "eframe",
  "egui",
+ "js-sys",
  "log",
  "rfd",
  "serde",
  "serde_json",
- "walkdir",
  "wasm-bindgen-futures",
  "web-sys",
 ]

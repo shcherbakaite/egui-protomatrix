@@ -1,12 +1,13 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use eframe::egui;
 use serde::{Deserialize, Serialize};
-#[cfg(not(target_arch = "wasm32"))]
-use walkdir::WalkDir;
 
-use crate::kicad9::Footprint;
+#[cfg(target_arch = "wasm32")]
+use eframe::wasm_bindgen::{closure::Closure, JsCast};
+
 use crate::protomatrix::{
     ProtoSide, ProtomatrixConfig, ProtomatrixPointerState, ProtomatrixTarget,
 };
@@ -76,10 +77,89 @@ enum EditingAnnotation {
     Existing { index: usize, original: String },
 }
 
-mod footprint;
-mod kicad9;
 mod protomatrix;
 mod router;
+
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    static PENDING_FILE_LOAD: RefCell<Option<String>> = RefCell::new(None);
+}
+
+/// Trigger native file picker and read selected file as text. On completion, stores result in
+/// PENDING_FILE_LOAD and requests repaint. Call ctx.request_repaint() after this to process next frame.
+#[cfg(target_arch = "wasm32")]
+fn wasm_pick_file_for_open(ctx: egui::Context) {
+    let document = web_sys::window()
+        .and_then(|w| w.document())
+        .expect("No document");
+    let input = document
+        .create_element("input")
+        .expect("create input")
+        .dyn_into::<web_sys::HtmlInputElement>()
+        .expect("input element");
+    input.set_attribute("type", "file").expect("set type");
+    input.set_attribute("accept", ".json,application/json").expect("set accept");
+    input.style().set_property("display", "none").expect("set style");
+    document.body().expect("no body").append_child(&input).expect("append");
+
+    let ctx = ctx.clone();
+    let on_change = Closure::once(Box::new(move |e: web_sys::Event| {
+        let target = e.target().and_then(|t| t.dyn_into::<web_sys::HtmlInputElement>().ok());
+        if let Some(input) = target {
+            if let Some(files) = input.files() {
+                if let Some(file) = files.get(0) {
+                    let reader = web_sys::FileReader::new().expect("FileReader");
+                    let reader_clone = reader.clone();
+                    let ctx = ctx.clone();
+                    let on_load = Closure::once(Box::new(move |_: web_sys::ProgressEvent| {
+                        if let Ok(result) = reader_clone.result() {
+                            if let Some(text) = result.as_string() {
+                                PENDING_FILE_LOAD.with(|cell| *cell.borrow_mut() = Some(text));
+                            }
+                        }
+                        ctx.request_repaint();
+                    }));
+                    reader.set_onload(Some(on_load.as_ref().unchecked_ref()));
+                    let _ = reader.read_as_text(&file);
+                    on_load.forget();
+                }
+            }
+            if let Some(parent) = input.parent_element() {
+                let _ = parent.remove_child(&input);
+            }
+        }
+    }) as Box<dyn FnOnce(_)>);
+    input.set_onchange(Some(on_change.as_ref().unchecked_ref()));
+    on_change.forget();
+    let _ = input.click();
+}
+
+/// Trigger download of board JSON. In browser, creates a blob URL and simulates anchor click.
+#[cfg(target_arch = "wasm32")]
+fn wasm_download_board(filename: &str, content: &str) {
+    let window = web_sys::window().expect("No window");
+    let document = window.document().expect("No document");
+    let opts = web_sys::BlobPropertyBag::new();
+    opts.set_type("application/json");
+    let blob = web_sys::Blob::new_with_str_sequence_and_options(
+        &js_sys::Array::of1(&js_sys::JsString::from(content)),
+        &opts,
+    )
+    .expect("Blob");
+    let url = web_sys::Url::create_object_url_with_blob(&blob).expect("Object URL");
+    let a = document
+        .create_element("a")
+        .expect("create anchor")
+        .dyn_into::<web_sys::HtmlAnchorElement>()
+        .expect("anchor");
+    a.set_href(&url);
+    a.set_download(filename);
+    a.style().set_property("display", "none").expect("set style");
+    document.body().expect("no body").append_child(&a).expect("append");
+    a.click();
+    let _ = document.body().unwrap().remove_child(&a);
+    let _ = web_sys::Url::revoke_object_url(&url);
+}
 
 const MASK_COLOR: egui::Color32 = egui::Color32::from_rgb(0x18, 0x18, 0x18);
 const OUTLINE_COLOR: egui::Color32 = egui::Color32::from_rgb(0x60, 0x60, 0x60);
@@ -185,14 +265,6 @@ fn migrate_net_metadata_after_autoroute(
 
 #[cfg(not(target_arch = "wasm32"))]
 fn main() -> eframe::Result<()> {
-    if std::env::args().any(|a| a == "--check-footprints") {
-        check_footprints();
-        return Ok(());
-    }
-
-    let path = Path::new("/usr/share/kicad/footprints/Package_DIP.pretty/DIP-10_W10.16mm.kicad_mod");
-    let _f1 = footprint::load_footprint(path);
-
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1200.0, 800.0]),
@@ -256,25 +328,9 @@ const ZOOM_MAX: f32 = 25.0;
 /// Scroll-to-zoom: scale factor per point of smooth scroll (reduces stutter vs raw_scroll_delta).
 const ZOOM_SENSITIVITY: f32 = 0.0008;
 
-/// Loaded Package_DIP library; one footprint is drawn for demo.
-const PACKAGE_DIP_PATH: &str = "/usr/share/kicad/footprints/Package_DIP.pretty/";
-//const PACKAGE_DIP_PATH: &str = "/usr/share/kicad/footprints/Resistor_THT.pretty";
-
-
-/// Single footprint to load when directory load fails (any .kicad_mod name).
-const FALLBACK_FOOTPRINT: &str = "DIP-4_W7.62mm";
-
 struct CanvasApp {
     pan: egui::Vec2,
     zoom: f32,
-    /// Loaded footprints from Package_DIP (name -> Footprint).
-    dip_lib: Option<HashMap<String, Footprint>>,
-    /// Package position in mm. None = use default (to the right of board).
-    dip_pos_mm: Option<egui::Vec2>,
-    /// Package rotation in degrees (counterclockwise). 0 = default orientation.
-    dip_rotation_deg: f32,
-    /// True while left-dragging the package (so we keep moving it until release).
-    dragging_package: bool,
     /// Protomatrix layout configuration.
     protomatrix_config: ProtomatrixConfig,
     /// Hover and click state for protomatrix elements.
@@ -362,19 +418,9 @@ impl CanvasApp {
             .push("Rockwell Bold".to_owned());
         cc.egui_ctx.set_fonts(fonts);
 
-        let dip_lib = load_package_dip();
-        if let Some(ref lib) = dip_lib {
-            print_footprint_info(lib);
-        } else {
-            println!("[footprint] no library loaded from {}", PACKAGE_DIP_PATH);
-        }
         Self {
             pan: egui::Vec2::ZERO,
             zoom: 1.0,
-            dip_lib,
-            dip_pos_mm: None,
-            dip_rotation_deg: 0.0,
-            dragging_package: false,
             protomatrix_config: ProtomatrixConfig::default(),
             protomatrix_state: ProtomatrixPointerState::default(),
             last_clicked: None,
@@ -450,10 +496,9 @@ impl CanvasApp {
         }
     }
 
-    fn load_board(&mut self, path: &std::path::Path) -> Result<(), String> {
-        let s = std::fs::read_to_string(path)
-            .map_err(|e| format!("Read failed: {}", e))?;
-        let board: BoardFile = serde_json::from_str(&s)
+    /// Load board from JSON string. Used by both native (after file read) and WASM (after file picker).
+    fn load_board_from_json(&mut self, s: &str) -> Result<(), String> {
+        let board: BoardFile = serde_json::from_str(s)
             .map_err(|e| format!("Parse failed: {}", e))?;
         self.protomatrix_config = board.config;
         self.connections = board.connections;
@@ -467,11 +512,11 @@ impl CanvasApp {
         self.row_drag_source = None;
         self.selected_net = None;
         self.run_autoroute();
-        self.file_path = Some(path.to_path_buf());
         Ok(())
     }
 
-    fn save_board(&self, path: &std::path::Path) -> Result<(), String> {
+    /// Serialize board to JSON string. Used by both native (before file write) and WASM (for download).
+    fn save_board_json(&self) -> Result<String, String> {
         let board = BoardFile {
             config: self.protomatrix_config.clone(),
             connections: self.connections.clone(),
@@ -481,8 +526,21 @@ impl CanvasApp {
             annotations: self.annotations.clone(),
             column_annotations: self.column_annotations.clone(),
         };
-        let s = serde_json::to_string_pretty(&board)
-            .map_err(|e| format!("Serialize failed: {}", e))?;
+        serde_json::to_string_pretty(&board).map_err(|e| format!("Serialize failed: {}", e))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn load_board(&mut self, path: &std::path::Path) -> Result<(), String> {
+        let s = std::fs::read_to_string(path)
+            .map_err(|e| format!("Read failed: {}", e))?;
+        self.load_board_from_json(&s)?;
+        self.file_path = Some(path.to_path_buf());
+        Ok(())
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn save_board(&self, path: &std::path::Path) -> Result<(), String> {
+        let s = self.save_board_json()?;
         std::fs::write(path, s).map_err(|e| format!("Write failed: {}", e))?;
         Ok(())
     }
@@ -558,129 +616,6 @@ impl CanvasApp {
         self.jumper_state = None;
         self.autoroute_error = None;
         self.file_path = None;
-    }
-}
-
-/// Print summary of loaded footprint library and the first footprint (the one we draw).
-fn print_footprint_info(lib: &HashMap<String, Footprint>) {
-    println!("[footprint] loaded {} footprint(s) from {}", lib.len(), PACKAGE_DIP_PATH);
-    if let Some((name, fp)) = lib.iter().next() {
-        let pad_count = fp.pads().count();
-        let graphic_count = fp.graphics().count();
-        println!(
-            "[footprint] drawing '{}': elements={} pads={} graphics={}",
-            name,
-            fp.elements.len(),
-            pad_count,
-            graphic_count
-        );
-    }
-}
-
-/// Load Package_DIP footprint library from system path.
-/// On WASM, returns None (no filesystem access).
-fn load_package_dip() -> Option<HashMap<String, Footprint>> {
-    #[cfg(target_arch = "wasm32")]
-    return None;
-
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-    let mut candidates: Vec<std::path::PathBuf> = vec![
-        PACKAGE_DIP_PATH.into(),
-        "/usr/share/kicad/footprints".into(),
-    ];
-    if let Ok(env_path) = std::env::var("KICAD_FOOTPRINTS") {
-        candidates.insert(0, Path::new(&env_path).join("Package_DIP.pretty"));
-    }
-    for path in candidates {
-        match footprint::load_footprint_dir(&path) {
-            Ok(lib) if !lib.is_empty() => {
-                println!("[footprint] loaded from {}", path.display());
-                return Some(lib);
-            }
-            Ok(_) => {
-                println!("[footprint] dir empty: {}", path.display());
-            }
-            Err(e) => {
-                println!("[footprint] dir failed {}: {}", path.display(), e);
-            }
-        }
-        // Fallback: load one footprint from this candidate.
-        let single = path.join(format!("{}.kicad_mod", FALLBACK_FOOTPRINT));
-        if let Ok(module) = footprint::load_footprint(&single) {
-            println!("[footprint] loaded single from {}", single.display());
-            let mut map = HashMap::new();
-            map.insert(module.name.clone(), module);
-            return Some(map);
-        }
-    }
-    None
-    }
-}
-
-/// Run footprint parse check: walk /usr/share/kicad/footprints, try to parse each .kicad_mod,
-/// report errors grouped by unknown element type. Run with: cargo run -- --check-footprints
-#[cfg(not(target_arch = "wasm32"))]
-fn check_footprints() {
-    let root = Path::new("/usr/share/kicad/footprints");
-    if !root.exists() {
-        eprintln!("footprints dir not found: {}", root.display());
-        return;
-    }
-
-    let mut ok = 0u64;
-    let mut fail = 0u64;
-    let mut errors: HashMap<String, Vec<(String, String)>> = HashMap::new();
-
-    for entry in WalkDir::new(root).follow_links(true).max_depth(2) {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(e) => {
-                eprintln!("walk error: {}", e);
-                continue;
-            }
-        };
-        let path = entry.path();
-        if path.is_file()
-            && path
-                .extension()
-                .and_then(std::ffi::OsStr::to_str)
-                .map_or(false, |e| e == "kicad_mod")
-        {
-            match footprint::load_footprint(path) {
-                Ok(_fp) => ok += 1,
-                Err(e) => {
-                    fail += 1;
-                    let err_str = format!("{:?}", e);
-                    let key = extract_unknown_element(&err_str)
-                        .map(String::from)
-                        .unwrap_or_else(|| "other".to_string());
-                    errors.entry(key).or_default().push((
-                        path.display().to_string(),
-                        err_str,
-                    ));
-                }
-            }
-        }
-    }
-
-    println!("Parse results:");
-    println!("  OK: {}", ok);
-    println!("  Fail: {}", fail);
-    if !errors.is_empty() {
-        println!("\nErrors by type:");
-        let mut keys: Vec<_> = errors.keys().collect();
-        keys.sort();
-        for key in keys {
-            let v = &errors[key];
-            println!("  {} ({} files):", key, v.len());
-            for (path, err) in v.iter().take(3) {
-                println!("    {} -> {}", path, err);
-            }
-            if v.len() > 3 {
-                println!("    ... and {} more", v.len() - 3);
-            }
-        }
     }
 }
 
@@ -807,19 +742,18 @@ fn protomatrix_target_label(t: &ProtomatrixTarget) -> String {
     }
 }
 
-fn extract_unknown_element(err: &str) -> Option<&str> {
-    let prefix = "unknown element in module: ";
-    if let Some(start) = err.find(prefix) {
-        let rest = &err[start + prefix.len()..];
-        if let Some(end) = rest.find('"') {
-            return Some(rest[..end].trim());
-        }
-    }
-    None
-}
-
 impl eframe::App for CanvasApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Process pending file load from WASM file picker
+        #[cfg(target_arch = "wasm32")]
+        {
+            if let Some(content) = PENDING_FILE_LOAD.with(|c| c.borrow_mut().take()) {
+                if let Err(e) = self.load_board_from_json(&content) {
+                    log::error!("Load error: {}", e);
+                }
+            }
+        }
+
         // Menu bar
         egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
@@ -874,7 +808,22 @@ impl eframe::App for CanvasApp {
                     }
                     #[cfg(target_arch = "wasm32")]
                     {
-                        ui.label("File operations not available in browser");
+                        if ui.button("Open…").clicked() {
+                            ui.close();
+                            wasm_pick_file_for_open(ctx.clone());
+                        }
+                        if ui.button("Save").clicked() {
+                            ui.close();
+                            if let Ok(json) = self.save_board_json() {
+                                wasm_download_board("board.json", &json);
+                            }
+                        }
+                        if ui.button("Save As…").clicked() {
+                            ui.close();
+                            if let Ok(json) = self.save_board_json() {
+                                wasm_download_board("board.json", &json);
+                            }
+                        }
                         ui.separator();
                     }
                     if ui.button("Close").clicked() {
@@ -1052,14 +1001,6 @@ impl eframe::App for CanvasApp {
                 .union(egui::Sense::hover());
             let response = ui.allocate_rect(rect, sense);
 
-            if ui.input(|i| i.pointer.primary_released()) {
-                self.dragging_package = false;
-            }
-
-            if self.dip_lib.is_some() && ui.input(|i| i.key_pressed(egui::Key::R)) {
-                self.dip_rotation_deg = (self.dip_rotation_deg + 90.0).rem_euclid(360.0);
-            }
-
             // Pan: middle or right mouse drag (round to pixel to avoid sub-pixel jitter)
             if response.dragged_by(egui::PointerButton::Middle)
                 || response.dragged_by(egui::PointerButton::Secondary)
@@ -1097,37 +1038,19 @@ impl eframe::App for CanvasApp {
             let scale = base_scale * self.zoom;
             let origin = rect.center() - board_center_mm * scale;
 
-            let default_dip_mm = egui::vec2(x_max + 18.0, 0.0);
-            let dip_pos_mm = self.dip_pos_mm.unwrap_or(default_dip_mm);
-
-            // Pointer position in world mm (for package grab hit-test)
+            // Pointer position in world mm
             let pointer_mm = response.hover_pos().map(|pos| {
                 egui::vec2(
                     (pos.x - origin.x - self.pan.x) / scale,
                     (pos.y - origin.y - self.pan.y) / scale,
                 )
             });
-            let package_visible = self.dip_lib.is_some();
-            let pointer_over_package = package_visible
-                && pointer_mm.map_or(false, |p| {
-                    self.dip_lib.as_ref().map_or(false, |lib| {
-                        lib.iter().next().map_or(false, |(_name, fp)| {
-                            let bounds = footprint::footprint_bounds_local(fp);
-                            footprint::point_in_footprint_bounds(
-                                p.x, p.y,
-                                dip_pos_mm.x, dip_pos_mm.y,
-                                self.dip_rotation_deg as f64,
-                                bounds,
-                            )
-                        })
-                    })
-                });
 
-            // Start connection drag when pressing on a pad (and not over package)
-            if ui.input(|i| i.pointer.primary_pressed()) && !self.dragging_package {
+            // Start connection drag when pressing on a pad
+            if ui.input(|i| i.pointer.primary_pressed()) {
                 let mut started_drag = false;
                 if let Some(target) = pointer_mm.and_then(|p| protomatrix::hit_test(&self.protomatrix_config, p.x, p.y)) {
-                    if matches!(target, ProtomatrixTarget::Pad { .. }) && !pointer_over_package {
+                    if matches!(target, ProtomatrixTarget::Pad { .. }) {
                         self.connection_drag_source = Some(target);
                         started_drag = true;
                     } else {
@@ -1206,22 +1129,12 @@ impl eframe::App for CanvasApp {
                         ann.pos_mm[0] += delta_mm.x;
                         ann.pos_mm[1] += delta_mm.y;
                     }
-                } else if (self.dragging_package || pointer_over_package) && package_visible
-                    && self.connection_drag_source.is_none()
-                {
-                    if !self.dragging_package {
-                        self.dip_pos_mm = Some(dip_pos_mm);
-                        self.dragging_package = true;
-                    }
-                    if let Some(ref mut pos) = self.dip_pos_mm {
-                        *pos += delta_mm;
-                    }
                 }
             }
 
-            // Protomatrix hover/click events (only when not dragging package)
-            let primary_clicked = response.clicked() && !self.dragging_package;
-            let primary_double_clicked = response.double_clicked() && !self.dragging_package;
+            // Protomatrix hover/click events
+            let primary_clicked = response.clicked();
+            let primary_double_clicked = response.double_clicked();
             protomatrix::handle_pointer_input(
                 &self.protomatrix_config,
                 pointer_mm,
@@ -1620,36 +1533,12 @@ impl eframe::App for CanvasApp {
                 }
             }
 
-            // Draw one footprint (any from the library); position is draggable.
-            if let Some(ref lib) = self.dip_lib {
-                if let Some((_name, fp)) = lib.iter().next() {
-                    let view_dip = (
-                        view.0,
-                        view.1.max(dip_pos_mm.x + 25.0),
-                        view.2.min(dip_pos_mm.y - 12.0),
-                        view.3.max(dip_pos_mm.y + 12.0),
-                    );
-                    footprint::draw_footprint(
-                        &painter,
-                        &to_screen,
-                        scale,
-                        view_dip,
-                        fp,
-                        dip_pos_mm.x,
-                        dip_pos_mm.y,
-                        self.dip_rotation_deg as f64,
-                    );
-                }
-            }
-
-            if self.dragging_package {
+            if self.annotation_drag_source.is_some() {
                 ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
-            } else if self.annotation_drag_source.is_some() {
+            } else             if self.annotation_drag_source.is_some() {
                 ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
             } else if self.row_drag_source.is_some() {
                 ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
-            } else if pointer_over_package {
-                ctx.set_cursor_icon(egui::CursorIcon::Grab);
             } else if response.dragged() {
                 ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
             } else if self.protomatrix_state.hovered.is_some() {

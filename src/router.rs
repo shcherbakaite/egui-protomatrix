@@ -123,6 +123,23 @@ impl JumperState {
     pub fn closed_count(&self) -> usize {
         self.jumper_net.len()
     }
+
+    /// All columns (side, col) in the given net. Used to migrate net names when canonical key changes.
+    pub fn columns_for_net(&self, net_idx: usize) -> HashSet<ColumnKey> {
+        self.jumper_net
+            .iter()
+            .filter(|(_, &ni)| ni == net_idx)
+            .map(|(&(side, col, _), _)| ColumnKey { side, col })
+            .collect()
+    }
+
+    /// Net index for a given matrix row (Y row). Lower and Upper row j are the same logical row.
+    pub fn net_for_row(&self, row: i32) -> Option<usize> {
+        self.jumper_net
+            .iter()
+            .find(|(&(_, _, r), _)| r == row)
+            .map(|(_, &ni)| ni)
+    }
 }
 
 impl JumperStateProvider for JumperState {
@@ -165,11 +182,21 @@ fn compute_nets(connections: &[Connection]) -> Vec<HashSet<ColumnKey>> {
     nets
 }
 
+fn column_key_to_string(col: &ColumnKey) -> String {
+    let side = match col.side {
+        ProtoSide::Lower => 'L',
+        ProtoSide::Upper => 'U',
+    };
+    format!("{}{}", side, col.col)
+}
+
 /// Assign nets to matrix rows. Cross-side nets get the same row on both sides.
 /// Returns (net, row_index). Fails if too many nets.
+/// If net_row_pins is provided, pinned nets go to their rows; unpinned nets fill remaining rows.
 fn assign_nets_to_rows(
     config: &ProtomatrixConfig,
     nets: &[HashSet<ColumnKey>],
+    net_row_pins: Option<&std::collections::HashMap<String, i32>>,
 ) -> Result<Vec<(HashSet<ColumnKey>, i32)>, String> {
     let matrix_size = config.matrix_size;
     if nets.len() > matrix_size as usize {
@@ -180,24 +207,60 @@ fn assign_nets_to_rows(
         ));
     }
 
-    Ok(nets
+    let net_canonical_keys: Vec<ColumnKey> = nets
         .iter()
-        .enumerate()
-        .map(|(i, net)| (net.clone(), i as i32))
+        .map(|net| *net.iter().min().unwrap_or(&ColumnKey {
+            side: ProtoSide::Lower,
+            col: 0,
+        }))
+        .collect();
+
+    let mut used_rows: std::collections::HashSet<i32> = std::collections::HashSet::new();
+    let mut assignments: Vec<Option<(HashSet<ColumnKey>, i32)>> = vec![None; nets.len()];
+    let valid_range = 0..matrix_size;
+
+    // First pass: assign pinned nets to their rows
+    if let Some(pins) = net_row_pins {
+        for (net_idx, net) in nets.iter().enumerate() {
+            let canon = net_canonical_keys[net_idx];
+            let canon_str = column_key_to_string(&canon);
+            if let Some(&row) = pins.get(&canon_str) {
+                if valid_range.contains(&row) && !used_rows.contains(&row) {
+                    used_rows.insert(row);
+                    assignments[net_idx] = Some((net.clone(), row));
+                }
+            }
+        }
+    }
+
+    // Second pass: assign unpinned nets to free rows in ascending order
+    let mut free_iter = (0..matrix_size).filter(|r| !used_rows.contains(r));
+    for (net_idx, net) in nets.iter().enumerate() {
+        if assignments[net_idx].is_none() {
+            let row = free_iter.next().expect("enough rows for unpinned nets");
+            assignments[net_idx] = Some((net.clone(), row));
+        }
+    }
+
+    Ok(assignments
+        .into_iter()
+        .map(|a| a.expect("all nets assigned"))
         .collect())
 }
 
 /// Run autoroute: connections → nets → row assignment → jumper states.
+/// If net_row_pins is provided, pinned nets are assigned to their rows; unpinned nets fill the rest.
 pub fn autoroute(
     config: &ProtomatrixConfig,
     connections: &[Connection],
+    net_row_pins: Option<&std::collections::HashMap<String, i32>>,
 ) -> AutorouteResult {
     let nets = compute_nets(connections);
     if nets.is_empty() {
         return AutorouteResult::Ok(JumperState::default());
     }
 
-    let assignments = match assign_nets_to_rows(config, &nets) {
+    let assignments = match assign_nets_to_rows(config, &nets, net_row_pins) {
         Ok(a) => a,
         Err(e) => return AutorouteResult::Err(e),
     };

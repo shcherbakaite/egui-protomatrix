@@ -115,8 +115,49 @@ impl ProtomatrixConfig {
     }
 
     fn matrix_row_end_x(&self) -> f32 {
-        (self.proto_area.0 as f32 - 1.0) * self.proto_pitch_mm - self.offset_50mil_mm
+        // Extend to the last column via (right of last solder jumper)
+        (self.proto_area.0 as f32 - 0.5) * self.proto_pitch_mm
     }
+
+    /// Y position (mm) of the lower matrix column annotation row (outer row below net labels).
+    pub fn lower_column_annotation_y(&self) -> f32 {
+        let last_row = self.matrix_size - 1;
+        self.lower_matrix_row_y(last_row) + self.offset_100mil_mm * 3.0
+    }
+
+    /// Y position (mm) of the upper matrix column annotation row (outer row above net labels).
+    pub fn upper_column_annotation_y(&self) -> f32 {
+        let last_row = self.matrix_size - 1;
+        self.upper_matrix_row_y(last_row) - self.offset_100mil_mm * 3.0
+    }
+}
+
+/// Hit-test for column annotation row. Returns (side, col) if pointer is in the annotation row area.
+/// Used for double-click to edit column annotations.
+pub fn column_annotation_at(config: &ProtomatrixConfig, x_mm: f32, y_mm: f32) -> Option<(ProtoSide, i32)> {
+    let offset = config.offset_100mil_mm;
+    let pitch = config.proto_pitch_mm;
+    let cols = config.proto_area.0;
+
+    // Column from x (center of column)
+    let col_f = x_mm / pitch;
+    let col = col_f.round() as i32;
+    if col < 0 || col >= cols {
+        return None;
+    }
+
+    let y_lo = config.lower_column_annotation_y();
+    let y_hi = config.upper_column_annotation_y();
+
+    // Lower: row below net labels, y increases downward (board coords)
+    if y_mm >= y_lo - offset && y_mm <= y_lo + offset {
+        return Some((ProtoSide::Lower, col));
+    }
+    // Upper: row above net labels, y decreases upward
+    if y_mm >= y_hi - offset && y_mm <= y_hi + offset {
+        return Some((ProtoSide::Upper, col));
+    }
+    None
 }
 
 /// Solder jumper polygon vertices (right half, mm; footprint origin at center; KiCad y-up).
@@ -333,11 +374,40 @@ pub fn net_color(net_index: usize) -> egui::Color32 {
     NET_COLORS[net_index % NET_COLORS.len()]
 }
 
+/// Slight brightness boost for selection highlight (subtle).
+pub fn net_color_highlight(base: egui::Color32) -> egui::Color32 {
+    let blend = 12; // subtle: ~5% toward white
+    let r = (base.r() as u16 + blend).min(255) as u8;
+    let g = (base.g() as u16 + blend).min(255) as u8;
+    let b = (base.b() as u16 + blend).min(255) as u8;
+    egui::Color32::from_rgb(r, g, b)
+}
+
+/// Slight darkening for non-selected nets when one is selected (subtle).
+pub fn net_color_dimmed(base: egui::Color32) -> egui::Color32 {
+    let dim = 18; // subtle: ~7% toward black
+    let r = base.r().saturating_sub(dim);
+    let g = base.g().saturating_sub(dim);
+    let b = base.b().saturating_sub(dim);
+    egui::Color32::from_rgb(r, g, b)
+}
+
 const MASK_COLOR: egui::Color32 = egui::Color32::from_rgb(0x18, 0x18, 0x18);
 const OUTLINE_COLOR: egui::Color32 = egui::Color32::from_rgb(0x60, 0x60, 0x60);
 const HOLE_COLOR: egui::Color32 = egui::Color32::from_rgb(0x28, 0x20, 0x1c);
 /// KiCad-style silkscreen (white/cream).
 const SILKSCREEN_COLOR: egui::Color32 = egui::Color32::from_rgb(0xf0, 0xf0, 0xe8);
+
+fn silkscreen_font_id(size: f32, bold: bool) -> egui::FontId {
+    egui::FontId {
+        size,
+        family: egui::FontFamily::Name(if bold {
+            "Rockwell Bold".into()
+        } else {
+            "Rockwell".into()
+        }),
+    }
+}
 
 /// Trait for querying which solder jumpers should be closed (autorouter output).
 pub trait JumperStateProvider {
@@ -354,6 +424,19 @@ pub trait JumperStateProvider {
 
 fn track_color() -> egui::Color32 {
     egui::Color32::from_rgba_unmultiplied(128, 128, 128, 140)
+}
+
+/// Net color with transparency (for Y tracks and y connecting tracks).
+fn net_color_transparent(
+    net_color: egui::Color32,
+    alpha: u8,
+) -> egui::Color32 {
+    egui::Color32::from_rgba_unmultiplied(
+        net_color.r(),
+        net_color.g(),
+        net_color.b(),
+        alpha,
+    )
 }
 
 #[inline(always)]
@@ -399,6 +482,7 @@ fn draw_solder_jumper_pad(
 /// Draw jumper indicators on proto pads that are connected via the matrix.
 /// Shows a colored ring around each pad that belongs to a net (closed jumper in that column).
 /// If `net_color_override` is Some, it maps net_index -> color; otherwise uses default palette.
+/// If `selected_net` is Some, that net's rings are highlighted (brighter, thicker).
 pub fn draw_proto_jumper_indicators<J: JumperStateProvider + ?Sized>(
     config: &ProtomatrixConfig,
     painter: &egui::Painter,
@@ -407,6 +491,7 @@ pub fn draw_proto_jumper_indicators<J: JumperStateProvider + ?Sized>(
     view: (f32, f32, f32, f32),
     jumper_state: Option<&J>,
     net_color_override: Option<&dyn Fn(usize) -> egui::Color32>,
+    selected_net: Option<usize>,
 ) {
     let Some(js) = jumper_state else {
         return;
@@ -425,16 +510,27 @@ pub fn draw_proto_jumper_indicators<J: JumperStateProvider + ?Sized>(
         }
     }
     let pad_r = config.proto_pad_dia_mm / 2.0;
-    let stroke_w = (0.3_f32).max(config.track_width_mm * 0.6) * scale;
+    let base_stroke = (0.3_f32).max(config.track_width_mm * 0.6) * scale;
+    let highlight_stroke = base_stroke * 1.15; // subtle thickness increase
     let color_for = |net_idx: usize| {
-        net_color_override
+        let base = net_color_override
             .map(|f| f(net_idx))
-            .unwrap_or_else(|| net_color(net_idx))
+            .unwrap_or_else(|| net_color(net_idx));
+        match selected_net {
+            Some(sel) if sel == net_idx => net_color_highlight(base),
+            Some(_) => net_color_dimmed(base),
+            None => base,
+        }
     };
     // Lower proto area
     for i in 0..config.proto_area.0 {
         if let Some(&net_idx) = col_net.get(&(ProtoSide::Lower, i)) {
             let color = color_for(net_idx);
+            let stroke_w = if selected_net == Some(net_idx) {
+                highlight_stroke
+            } else {
+                base_stroke
+            };
             for j in 0..config.proto_area.1 {
                 let x = i as f32 * config.proto_pitch_mm;
                 let y = j as f32 * config.proto_pitch_mm;
@@ -450,6 +546,11 @@ pub fn draw_proto_jumper_indicators<J: JumperStateProvider + ?Sized>(
     for i in 0..config.proto_area.0 {
         if let Some(&net_idx) = col_net.get(&(ProtoSide::Upper, i)) {
             let color = color_for(net_idx);
+            let stroke_w = if selected_net == Some(net_idx) {
+                highlight_stroke
+            } else {
+                base_stroke
+            };
             for j in 0..config.proto_area.1 {
                 let x = i as f32 * config.proto_pitch_mm;
                 let y = -config.proto_gap_mm - j as f32 * config.proto_pitch_mm;
@@ -501,6 +602,7 @@ pub fn draw_proto_pads(
 /// Draw matrix areas (solder jumpers + vias).
 /// If `jumper_state` is provided, closed jumpers are highlighted.
 /// If `net_color_override` is Some, it maps net_index -> color; otherwise uses default palette.
+/// If `selected_net` is Some, that net's solder jumpers use a brighter highlight fill.
 pub fn draw_matrix_areas<J: JumperStateProvider + ?Sized>(
     config: &ProtomatrixConfig,
     painter: &egui::Painter,
@@ -509,6 +611,7 @@ pub fn draw_matrix_areas<J: JumperStateProvider + ?Sized>(
     view: (f32, f32, f32, f32),
     jumper_state: Option<&J>,
     net_color_override: Option<&dyn Fn(usize) -> egui::Color32>,
+    selected_net: Option<usize>,
 ) {
     let (ox, _) = config.lower_matrix_offset();
     for j in 0..config.matrix_size {
@@ -521,14 +624,26 @@ pub fn draw_matrix_areas<J: JumperStateProvider + ?Sized>(
             let fill_color = jumper_state
                 .and_then(|js| js.net_index(ProtoSide::Lower, i, j))
                 .map(|ni| {
-                    net_color_override
+                    let base = net_color_override
                         .map(|f| f(ni))
-                        .unwrap_or_else(|| net_color(ni))
+                        .unwrap_or_else(|| net_color(ni));
+                    match selected_net {
+                        Some(sel) if sel == ni => net_color_highlight(base),
+                        Some(_) => net_color_dimmed(base),
+                        None => base,
+                    }
                 })
                 .unwrap_or(COPPER_COLOR);
             draw_solder_jumper_pad(painter, to_screen, x, y, fill_color);
             let via_x = x - config.proto_pitch_mm / 2.0;
             let vp = to_screen(via_x, y);
+            painter.circle_filled(vp, (config.via_dia_mm / 2.0) * scale, COPPER_COLOR);
+            painter.circle_filled(vp, (config.via_drill_mm / 2.0) * scale, MASK_COLOR);
+        }
+        // Last column via (end of Y track, right of last solder jumper)
+        let last_via_x = (config.proto_area.0 as f32 - 0.5) * config.proto_pitch_mm;
+        if in_view(last_via_x, y, view) {
+            let vp = to_screen(last_via_x, y);
             painter.circle_filled(vp, (config.via_dia_mm / 2.0) * scale, COPPER_COLOR);
             painter.circle_filled(vp, (config.via_drill_mm / 2.0) * scale, MASK_COLOR);
         }
@@ -544,9 +659,14 @@ pub fn draw_matrix_areas<J: JumperStateProvider + ?Sized>(
             let fill_color = jumper_state
                 .and_then(|js| js.net_index(ProtoSide::Upper, i, j))
                 .map(|ni| {
-                    net_color_override
+                    let base = net_color_override
                         .map(|f| f(ni))
-                        .unwrap_or_else(|| net_color(ni))
+                        .unwrap_or_else(|| net_color(ni));
+                    match selected_net {
+                        Some(sel) if sel == ni => net_color_highlight(base),
+                        Some(_) => net_color_dimmed(base),
+                        None => base,
+                    }
                 })
                 .unwrap_or(COPPER_COLOR);
             draw_solder_jumper_pad(painter, to_screen, x, y, fill_color);
@@ -555,20 +675,77 @@ pub fn draw_matrix_areas<J: JumperStateProvider + ?Sized>(
             painter.circle_filled(vp, (config.via_dia_mm / 2.0) * scale, COPPER_COLOR);
             painter.circle_filled(vp, (config.via_drill_mm / 2.0) * scale, MASK_COLOR);
         }
+        // Last column via (end of Y track, right of last solder jumper)
+        let last_via_x = (config.proto_area.0 as f32 - 0.5) * config.proto_pitch_mm;
+        if in_view(last_via_x, y, view) {
+            let vp = to_screen(last_via_x, y);
+            painter.circle_filled(vp, (config.via_dia_mm / 2.0) * scale, COPPER_COLOR);
+            painter.circle_filled(vp, (config.via_drill_mm / 2.0) * scale, MASK_COLOR);
+        }
     }
 }
 
 /// Draw tracks.
 /// Uses `Shape::line` for multi-point paths so segments connect without gaps at joints.
-pub fn draw_tracks(
+/// If `jumper_state` is provided, Y tracks and y connecting tracks use the net color (transparent).
+/// If `selected_net` is Some, that net's Y tracks and y connecting tracks are highlighted (brighter, thicker).
+pub fn draw_tracks<J: JumperStateProvider + ?Sized>(
     config: &ProtomatrixConfig,
     painter: &egui::Painter,
     to_screen: &impl Fn(f32, f32) -> egui::Pos2,
     scale: f32,
     view: (f32, f32, f32, f32),
+    jumper_state: Option<&J>,
+    net_color_override: Option<&dyn Fn(usize) -> egui::Color32>,
+    selected_net: Option<usize>,
 ) {
     let stroke_w = config.track_width_mm * scale;
-    let stroke = egui::Stroke::new(stroke_w, track_color());
+    let highlight_stroke_w = stroke_w * 1.12; // subtle thickness increase
+    const TRACK_ALPHA: u8 = 140;
+    const HIGHLIGHT_ALPHA: u8 = 165; // subtle brightness for selected tracks
+    let default_stroke = egui::Stroke::new(stroke_w, track_color());
+    let color_for = |net_idx: usize| {
+        let base = net_color_override
+            .map(|f| f(net_idx))
+            .unwrap_or_else(|| net_color(net_idx));
+        let c = match selected_net {
+            Some(sel) if sel == net_idx => net_color_transparent(net_color_highlight(base), HIGHLIGHT_ALPHA),
+            Some(_) => net_color_transparent(net_color_dimmed(base), TRACK_ALPHA.saturating_sub(30)),
+            None => net_color_transparent(base, TRACK_ALPHA),
+        };
+        c
+    };
+
+    // Build (side, row) -> net_index for Y tracks (first closed jumper in that row).
+    let mut row_net: std::collections::HashMap<(ProtoSide, i32), usize> =
+        std::collections::HashMap::new();
+    if let Some(js) = jumper_state {
+        for side in [ProtoSide::Lower, ProtoSide::Upper] {
+            for row in 0..config.matrix_size {
+                for col in 0..config.proto_area.0 {
+                    if let Some(net_idx) = js.net_index(side, col, row) {
+                        row_net.insert((side, row), net_idx);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    // Build (side, col) -> net_index for y connecting tracks.
+    let mut col_net: std::collections::HashMap<(ProtoSide, i32), usize> =
+        std::collections::HashMap::new();
+    if let Some(js) = jumper_state {
+        for side in [ProtoSide::Lower, ProtoSide::Upper] {
+            for col in 0..config.proto_area.0 {
+                for row in 0..config.matrix_size {
+                    if let Some(net_idx) = js.net_index(side, col, row) {
+                        col_net.insert((side, col), net_idx);
+                        break;
+                    }
+                }
+            }
+        }
+    }
 
     // Vertical proto tracks: one continuous path per column (avoids gaps at pad junctions).
     for i in 0..config.proto_area.0 {
@@ -577,7 +754,7 @@ pub fn draw_tracks(
             .map(|j| to_screen(x, j as f32 * config.proto_pitch_mm))
             .collect();
         if pts.len() >= 2 && segment_in_view(x, 0.0, x, (config.proto_area.1 - 1) as f32 * config.proto_pitch_mm, view) {
-            painter.add(egui::Shape::line(pts, stroke));
+            painter.add(egui::Shape::line(pts, default_stroke));
         }
     }
     for i in 0..config.proto_area.0 {
@@ -588,11 +765,11 @@ pub fn draw_tracks(
         let y0 = -config.proto_gap_mm;
         let y1 = -config.proto_gap_mm - (config.proto_area.1 - 1) as f32 * config.proto_pitch_mm;
         if pts.len() >= 2 && segment_in_view(x, y0, x, y1, view) {
-            painter.add(egui::Shape::line(pts, stroke));
+            painter.add(egui::Shape::line(pts, default_stroke));
         }
     }
 
-    // Matrix row horizontal + vertical link: one path per row so corner at link_x connects.
+    // Matrix row horizontal + vertical link (Y tracks): one path per row so corner at link_x connects.
     let center_y = -config.proto_gap_mm / 2.0;
     let end_x = config.matrix_row_end_x();
     for j in 0..config.matrix_size {
@@ -601,6 +778,13 @@ pub fn draw_tracks(
         if !segment_in_view(link_x, center_y.max(row_y), end_x, center_y.min(row_y), view) {
             continue;
         }
+        let stroke = row_net
+            .get(&(ProtoSide::Lower, j))
+            .map(|&ni| {
+                let w = if selected_net == Some(ni) { highlight_stroke_w } else { stroke_w };
+                egui::Stroke::new(w, color_for(ni))
+            })
+            .unwrap_or(default_stroke);
         let pts = vec![
             to_screen(link_x, center_y),
             to_screen(link_x, row_y),
@@ -614,6 +798,13 @@ pub fn draw_tracks(
         if !segment_in_view(link_x, center_y.min(row_y), end_x, center_y.max(row_y), view) {
             continue;
         }
+        let stroke = row_net
+            .get(&(ProtoSide::Upper, j))
+            .map(|&ni| {
+                let w = if selected_net == Some(ni) { highlight_stroke_w } else { stroke_w };
+                egui::Stroke::new(w, color_for(ni))
+            })
+            .unwrap_or(default_stroke);
         let pts = vec![
             to_screen(link_x, center_y),
             to_screen(link_x, row_y),
@@ -622,7 +813,7 @@ pub fn draw_tracks(
         painter.add(egui::Shape::line(pts, stroke));
     }
 
-    // Vertical jumper tracks between rows (single segments).
+    // Vertical jumper tracks between rows (y connecting tracks).
     for j in 0..config.matrix_size - 1 {
         let y0 = config.lower_matrix_row_y(j);
         let y1 = config.lower_matrix_row_y(j + 1);
@@ -631,6 +822,13 @@ pub fn draw_tracks(
             if !segment_in_view(px, y0, px, y1, view) {
                 continue;
             }
+            let stroke = col_net
+                .get(&(ProtoSide::Lower, i))
+                .map(|&ni| {
+                    let w = if selected_net == Some(ni) { highlight_stroke_w } else { stroke_w };
+                    egui::Stroke::new(w, color_for(ni))
+                })
+                .unwrap_or(default_stroke);
             painter.line_segment([to_screen(px, y0), to_screen(px, y1)], stroke);
         }
     }
@@ -642,6 +840,13 @@ pub fn draw_tracks(
             if !segment_in_view(px, y0, px, y1, view) {
                 continue;
             }
+            let stroke = col_net
+                .get(&(ProtoSide::Upper, i))
+                .map(|&ni| {
+                    let w = if selected_net == Some(ni) { highlight_stroke_w } else { stroke_w };
+                    egui::Stroke::new(w, color_for(ni))
+                })
+                .unwrap_or(default_stroke);
             painter.line_segment([to_screen(px, y0), to_screen(px, y1)], stroke);
         }
     }
@@ -663,7 +868,7 @@ pub fn draw_tracks(
             to_screen(cx, y_knob),
             to_screen(cx, y_end),
         ];
-        painter.add(egui::Shape::line(pts, stroke));
+        painter.add(egui::Shape::line(pts, default_stroke));
     }
     // Upper X linking: same pattern.
     let y_upper_bottom_pad = -config.proto_gap_mm
@@ -684,7 +889,7 @@ pub fn draw_tracks(
             to_screen(cx, y_upper_knob),
             to_screen(cx, y_upper_end),
         ];
-        painter.add(egui::Shape::line(pts, stroke));
+        painter.add(egui::Shape::line(pts, default_stroke));
     }
 }
 
@@ -744,6 +949,41 @@ pub fn draw_mounting_holes(
     }
 }
 
+/// Draw board size silkscreen label (e.g. "63x5x15") in the middle left, between left and middle mounting holes.
+pub fn draw_silkscreen_board_size(
+    config: &ProtomatrixConfig,
+    painter: &egui::Painter,
+    to_screen: &impl Fn(f32, f32) -> egui::Pos2,
+    scale: f32,
+    view: (f32, f32, f32, f32),
+) {
+    let center_y = -config.proto_gap_mm / 2.0;
+    let left_hole_x = config.proto_pitch_mm / 2.0;
+    let middle_hole_x =
+        (config.proto_area.0 as f32 - 1.0) * config.proto_pitch_mm / 2.0;
+    let label_x = (left_hole_x + middle_hole_x) / 2.0;
+
+    if !in_view(label_x, center_y, view) {
+        return;
+    }
+
+    let text = format!(
+        "2x{}x{}",
+        config.proto_area.0,
+        config.matrix_size
+    );
+    let font_size = (1.27_f32 * scale).max(6.0).min(14.0); // ~50mil base
+    let font_id = silkscreen_font_id(font_size, true);
+    let pos = to_screen(label_x, center_y);
+    painter.text(
+        pos,
+        egui::Align2::CENTER_CENTER,
+        text,
+        font_id,
+        SILKSCREEN_COLOR,
+    );
+}
+
 /// Proto column labels (letters a,b,c,... for proto rows, matching protomatrix.py BuildProtoColumnLabels).
 /// Lower proto rows get letters starting at index proto_area[1]; upper rows get a..e (reversed).
 pub fn draw_silkscreen_proto_column_labels(
@@ -756,7 +996,7 @@ pub fn draw_silkscreen_proto_column_labels(
     const LETTERS: &str = "abcdefghijklmnopqrstuvxyz";
     let label_x = -config.offset_100mil_mm;
     let font_size = (1.016_f32 * scale).max(6.0).min(14.0); // ~40mil base
-    let font_id = egui::FontId::proportional(font_size);
+    let font_id = silkscreen_font_id(font_size, false);
 
     // Lower proto: one label per row, letters f,g,h,... (index j + proto_area[1])
     for j in 0..config.proto_area.1 {
@@ -820,7 +1060,7 @@ pub fn draw_silkscreen_x_labels(
         } else {
             (0.635_f32 * scale).max(5.0).min(11.0) // ~25mil
         };
-        let font_id = egui::FontId::proportional(font_size);
+        let font_id = silkscreen_font_id(font_size, (i + 1) % 10 == 0);
         let pos = to_screen(x, label_y);
         painter.text(
             pos,
@@ -844,7 +1084,7 @@ pub fn draw_silkscreen_x_labels(
         } else {
             (0.635_f32 * scale).max(5.0).min(11.0) // ~25mil
         };
-        let font_id = egui::FontId::proportional(font_size);
+        let font_id = silkscreen_font_id(font_size, (i + 1) % 10 == 0);
         let pos = to_screen(x, label_y);
         painter.text(
             pos,
@@ -853,6 +1093,177 @@ pub fn draw_silkscreen_x_labels(
             font_id,
             SILKSCREEN_COLOR,
         );
+    }
+}
+
+/// Net labels next to columns that have a net (closed jumper).
+/// Draws the net name (or "Net N") at each column center, below X labels for lower and above for upper.
+/// `net_label_for_column`: (side, col, net_index) -> display string; when None, uses "Net {net_index}".
+/// `net_color_override`: when Some, maps net_index -> color for the label text.
+/// If `selected_net` is Some, that net's labels use a brighter highlight color.
+pub fn draw_net_labels<J: JumperStateProvider + ?Sized>(
+    config: &ProtomatrixConfig,
+    painter: &egui::Painter,
+    to_screen: &impl Fn(f32, f32) -> egui::Pos2,
+    scale: f32,
+    view: (f32, f32, f32, f32),
+    jumper_state: Option<&J>,
+    net_label_for_column: Option<&dyn Fn(ProtoSide, i32, usize) -> String>,
+    net_color_override: Option<&dyn Fn(usize) -> egui::Color32>,
+    selected_net: Option<usize>,
+) {
+    let Some(js) = jumper_state else {
+        return;
+    };
+    let offset_100mil = config.offset_100mil_mm;
+    let last_row = config.matrix_size - 1;
+    let font_size = (0.635_f32 * scale).max(5.0).min(11.0);
+    let font_id = silkscreen_font_id(font_size, false);
+    let label_for = |side: ProtoSide, col: i32, net_idx: usize| {
+        net_label_for_column
+            .map(|f| f(side, col, net_idx))
+            .unwrap_or_else(|| format!("Net {}", net_idx))
+    };
+    let color_for = |net_idx: usize| {
+        let base = net_color_override
+            .map(|f| f(net_idx))
+            .unwrap_or_else(|| net_color(net_idx));
+        match selected_net {
+            Some(sel) if sel == net_idx => net_color_highlight(base),
+            Some(_) => net_color_dimmed(base),
+            None => base,
+        }
+    };
+
+    // Build (side, col) -> net_index from closed jumpers
+    let mut col_net: std::collections::HashMap<(ProtoSide, i32), usize> =
+        std::collections::HashMap::new();
+    for side in [ProtoSide::Lower, ProtoSide::Upper] {
+        for col in 0..config.proto_area.0 {
+            for row in 0..config.matrix_size {
+                if let Some(net_idx) = js.net_index(side, col, row) {
+                    col_net.insert((side, col), net_idx);
+                    break;
+                }
+            }
+        }
+    }
+
+    // Lower matrix: net labels below X labels
+    let row_y = config.lower_matrix_row_y(last_row);
+    let label_y = row_y + offset_100mil * 2.0;
+    for i in 0..config.proto_area.0 {
+        if let Some(&net_idx) = col_net.get(&(ProtoSide::Lower, i)) {
+            let x = i as f32 * config.proto_pitch_mm;
+            if !in_view(x, label_y, view) {
+                continue;
+            }
+            let pos = to_screen(x, label_y);
+            let text = label_for(ProtoSide::Lower, i, net_idx);
+            painter.text(
+                pos,
+                egui::Align2::CENTER_TOP,
+                text,
+                font_id.clone(),
+                color_for(net_idx),
+            );
+        }
+    }
+
+    // Upper matrix: net labels above X labels
+    let row_y = config.upper_matrix_row_y(last_row);
+    let label_y = row_y - offset_100mil * 2.0;
+    for i in 0..config.proto_area.0 {
+        if let Some(&net_idx) = col_net.get(&(ProtoSide::Upper, i)) {
+            let x = i as f32 * config.proto_pitch_mm;
+            if !in_view(x, label_y, view) {
+                continue;
+            }
+            let pos = to_screen(x, label_y);
+            let text = label_for(ProtoSide::Upper, i, net_idx);
+            painter.text(
+                pos,
+                egui::Align2::CENTER_BOTTOM,
+                text,
+                font_id.clone(),
+                color_for(net_idx),
+            );
+        }
+    }
+}
+
+/// Outer row column annotations (second row beyond net labels, same X positions).
+/// Draws custom text at each column center, below net labels for lower and above for upper.
+/// `annotations`: column key (e.g. "L3", "U5") -> text; empty strings are not drawn.
+pub fn draw_column_annotations(
+    config: &ProtomatrixConfig,
+    painter: &egui::Painter,
+    to_screen: &impl Fn(f32, f32) -> egui::Pos2,
+    scale: f32,
+    view: (f32, f32, f32, f32),
+    column_annotations: &std::collections::HashMap<String, String>,
+) {
+    if column_annotations.is_empty() {
+        return;
+    }
+    let offset_100mil = config.offset_100mil_mm;
+    let last_row = config.matrix_size - 1;
+    let font_size = (0.635_f32 * scale).max(5.0).min(11.0);
+    let font_id = silkscreen_font_id(font_size, false);
+    let key_for = |side: ProtoSide, col: i32| {
+        let c = match side {
+            ProtoSide::Lower => 'L',
+            ProtoSide::Upper => 'U',
+        };
+        format!("{}{}", c, col)
+    };
+
+    // Lower matrix: outer row below net labels (offset_100mil * 3.0)
+    let row_y = config.lower_matrix_row_y(last_row);
+    let label_y = row_y + offset_100mil * 3.0;
+    for i in 0..config.proto_area.0 {
+        let key = key_for(ProtoSide::Lower, i);
+        if let Some(text) = column_annotations.get(&key) {
+            if text.is_empty() {
+                continue;
+            }
+            let x = i as f32 * config.proto_pitch_mm;
+            if !in_view(x, label_y, view) {
+                continue;
+            }
+            let pos = to_screen(x, label_y);
+            painter.text(
+                pos,
+                egui::Align2::CENTER_TOP,
+                text.as_str(),
+                font_id.clone(),
+                SILKSCREEN_COLOR,
+            );
+        }
+    }
+
+    // Upper matrix: outer row above net labels
+    let row_y = config.upper_matrix_row_y(last_row);
+    let label_y = row_y - offset_100mil * 3.0;
+    for i in 0..config.proto_area.0 {
+        let key = key_for(ProtoSide::Upper, i);
+        if let Some(text) = column_annotations.get(&key) {
+            if text.is_empty() {
+                continue;
+            }
+            let x = i as f32 * config.proto_pitch_mm;
+            if !in_view(x, label_y, view) {
+                continue;
+            }
+            let pos = to_screen(x, label_y);
+            painter.text(
+                pos,
+                egui::Align2::CENTER_BOTTOM,
+                text.as_str(),
+                font_id.clone(),
+                SILKSCREEN_COLOR,
+            );
+        }
     }
 }
 
@@ -866,7 +1277,7 @@ pub fn draw_silkscreen_y_labels(
 ) {
     let label_x = -config.offset_100mil_mm;
     let font_size = (0.635_f32 * scale).max(5.0).min(11.0); // ~25mil base
-    let font_id = egui::FontId::proportional(font_size);
+    let font_id = silkscreen_font_id(font_size, false);
 
     for j in 0..config.matrix_size {
         let row_y = config.lower_matrix_row_y(j);
@@ -900,6 +1311,42 @@ pub fn draw_silkscreen_y_labels(
 
 /// Grey color for the connection drag preview line.
 const DRAG_LINE_COLOR: egui::Color32 = egui::Color32::from_rgb(0x80, 0x80, 0x80);
+
+fn row_drop_highlight_color() -> egui::Color32 {
+    egui::Color32::from_rgba_unmultiplied(0x60, 0xa0, 0xff, 60)
+}
+
+/// Draw a highlight on the given matrix row (both lower and upper) as a drop target for row drag.
+pub fn draw_row_drop_highlight(
+    config: &ProtomatrixConfig,
+    painter: &egui::Painter,
+    to_screen: &impl Fn(f32, f32) -> egui::Pos2,
+    _scale: f32,
+    view: (f32, f32, f32, f32),
+    row: i32,
+) {
+    let half = config.matrix_size / 2;
+    let row_hit_margin = config.matrix_v_pitch_mm * 0.6;
+    let link_x_min = -config.offset_100mil_mm - (half - 1) as f32 * config.offset_30mil_mm;
+    let end_x = config.matrix_row_end_x();
+    let link_x = config.matrix_row_link_x(row);
+    let x_min = link_x_min.min(link_x);
+    let x_max = end_x;
+
+    let row_y_lo = config.lower_matrix_row_y(row);
+    let row_y_hi = config.upper_matrix_row_y(row);
+    for row_y in [row_y_lo, row_y_hi] {
+        let y_min = row_y - row_hit_margin;
+        let y_max = row_y + row_hit_margin;
+        if !segment_in_view(x_min, y_min, x_max, y_max, view) {
+            continue;
+        }
+        let tl = to_screen(x_min, y_min);
+        let br = to_screen(x_max, y_max);
+        let rect = egui::Rect::from_min_max(tl, br);
+        painter.rect_filled(rect, egui::CornerRadius::ZERO, row_drop_highlight_color());
+    }
+}
 
 /// Draw a grey line from source (pad) to current pointer position while dragging to create a connection.
 /// Call only when actively dragging; line is hidden when released.

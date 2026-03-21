@@ -522,7 +522,10 @@ pub fn draw_footprint(
     }
     // Draw pad position labels (pad numbers) on top.
     let font_size = (7.0 * scale).max(5.0).min(12.0);
-    let font_id = egui::FontId::proportional(font_size);
+    let font_id = egui::FontId {
+        size: font_size,
+        family: egui::FontFamily::Name("Rockwell".into()),
+    };
     for element in &fp.elements {
         if let Element::Pad(pad) = element {
             if !pad.layers.iter().any(|s| layer_drawable(s.as_str())) {

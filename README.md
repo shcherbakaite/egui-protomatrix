@@ -8,4 +8,4 @@ https://shcherbakaite.github.io/egui-protomatrix/
 https://github.com/protomatrix-xyz/protomatrix-designs
 
 # Protomatrix site
-https://www.protomatrix.xyz/
+http://www.protomatrix.xyz/

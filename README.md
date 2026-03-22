@@ -3,3 +3,9 @@ Protoroute is a free and open-source router and planning software that works wit
 # Online Version
 The app is published at
 https://shcherbakaite.github.io/egui-protomatrix/
+
+# Protomatrix board designs
+https://github.com/protomatrix-xyz/protomatrix-designs
+
+# Protomatrix site
+https://www.protomatrix.xyz/

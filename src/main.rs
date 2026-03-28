@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use eframe::egui;
@@ -11,7 +11,9 @@ use eframe::wasm_bindgen::{closure::Closure, JsCast};
 use crate::protomatrix::{
     ProtoSide, ProtomatrixConfig, ProtomatrixPointerState, ProtomatrixTarget,
 };
-use crate::router::{AutorouteResult, ColumnKey, Connection, JumperState};
+use crate::router::{
+    columns_in_rect_mm, AutorouteResult, ColumnKey, Connection, JumperState,
+};
 
 /// Ensure path has .json extension (for Linux/GTK which doesn't append automatically).
 fn ensure_json_extension(path: PathBuf) -> PathBuf {
@@ -390,6 +392,22 @@ struct CanvasApp {
     editing_annotation: Option<EditingAnnotation>,
     /// When Some(index), user is dragging this annotation to move it.
     annotation_drag_source: Option<usize>,
+    /// Proto columns selected with Ctrl+drag (for group column move).
+    column_selection: HashSet<ColumnKey>,
+    /// Marquee in screen space while Ctrl+dragging (corner a, corner b).
+    rect_select_drag: Option<(egui::Pos2, egui::Pos2)>,
+    /// Set when a column marquee just finished; avoids same-frame `clicked()` clearing the new selection.
+    just_completed_column_marquee: bool,
+    /// Pending "Move pins…": columns to relocate; next click on the board (or Enter) completes.
+    column_move_pending: Option<HashSet<ColumnKey>>,
+    /// Context menu was opened with a non-empty column marquee selection.
+    context_menu_column_selection: bool,
+    /// During Move pins…, rotate the block 180° (swap upper/lower and mirror column order); toggled with R.
+    column_pins_rotated_180: bool,
+    /// During Move pins…, preview flip to the other proto face (no board change until place); toggled with F.
+    column_pins_flip_vertical: bool,
+    /// Last validation message while hovering a move target (collision / out of range).
+    column_move_preview_error: Option<String>,
 }
 
 impl CanvasApp {
@@ -454,6 +472,14 @@ impl CanvasApp {
             column_annotations: HashMap::new(),
             editing_annotation: None,
             annotation_drag_source: None,
+            column_selection: HashSet::new(),
+            rect_select_drag: None,
+            just_completed_column_marquee: false,
+            column_move_pending: None,
+            context_menu_column_selection: false,
+            column_pins_rotated_180: false,
+            column_pins_flip_vertical: false,
+            column_move_preview_error: None,
         }
     }
 
@@ -522,6 +548,14 @@ impl CanvasApp {
         self.row_drag_source = None;
         self.selected_net = None;
         self.jumper_state = None;
+        self.clear_column_marquee_selection();
+        self.rect_select_drag = None;
+        self.just_completed_column_marquee = false;
+        self.column_move_pending = None;
+        self.column_pins_rotated_180 = false;
+        self.column_pins_flip_vertical = false;
+        self.column_move_preview_error = None;
+        self.context_menu_column_selection = false;
         self.run_autoroute();
         Ok(())
     }
@@ -628,7 +662,325 @@ impl CanvasApp {
         self.jumper_state = None;
         self.autoroute_error = None;
         self.file_path = None;
+        self.clear_column_marquee_selection();
+        self.rect_select_drag = None;
+        self.just_completed_column_marquee = false;
+        self.column_move_pending = None;
+        self.column_pins_rotated_180 = false;
+        self.column_pins_flip_vertical = false;
+        self.column_move_preview_error = None;
+        self.context_menu_column_selection = false;
     }
+
+    fn clear_column_marquee_selection(&mut self) {
+        self.column_selection.clear();
+    }
+
+    /// Commit Move pins… using pointer position for target column (pad/jumper column, else X snap to proto column).
+    fn try_complete_column_move(&mut self, pointer_mm: Option<egui::Vec2>) -> bool {
+        if self.column_move_pending.is_none() {
+            return false;
+        }
+        let target_col = pointer_mm
+            .and_then(|p| target_column_index_from_pointer(&self.protomatrix_config, p));
+        let Some(tc) = target_col else {
+            return false;
+        };
+        let pending_cols = self.column_move_pending.take().unwrap();
+        let proto_cols = self.protomatrix_config.proto_area.0;
+        let rotate = self.column_pins_rotated_180;
+        let flip = self.column_pins_flip_vertical;
+        match apply_column_group_move(
+            &mut self.connections,
+            &mut self.net_names,
+            &mut self.net_colors,
+            &mut self.net_row_pins,
+            &mut self.column_annotations,
+            &pending_cols,
+            tc,
+            proto_cols,
+            rotate,
+            flip,
+        ) {
+            Ok(()) => {
+                self.connection_error_preview = None;
+                self.column_pins_rotated_180 = false;
+                self.column_pins_flip_vertical = false;
+                self.column_move_preview_error = None;
+                self.clear_column_marquee_selection();
+                self.run_autoroute();
+            }
+            Err(e) => {
+                self.column_move_pending = Some(pending_cols);
+                self.autoroute_error = Some(e);
+            }
+        }
+        true
+    }
+
+    /// Marquee selection if non-empty, else the proto column under the hover cursor (pad/jumper).
+    fn columns_for_move_hotkey(&self) -> HashSet<ColumnKey> {
+        if !self.column_selection.is_empty() {
+            self.column_selection.clone()
+        } else if let Some(ck) = self
+            .protomatrix_state
+            .hovered
+            .as_ref()
+            .and_then(column_from_target)
+        {
+            [ck].into_iter().collect()
+        } else {
+            HashSet::new()
+        }
+    }
+}
+
+fn column_key_from_string(s: &str) -> Option<ColumnKey> {
+    let mut chars = s.chars();
+    let side = match chars.next()? {
+        'L' => ProtoSide::Lower,
+        'U' => ProtoSide::Upper,
+        _ => return None,
+    };
+    let col: i32 = s[1..].parse().ok()?;
+    Some(ColumnKey { side, col })
+}
+
+/// Map each selected column on a side to new indices starting at `target_start` for the **minimum**
+/// column on that side, preserving **relative column spacing** (gaps between selected columns).
+/// `rotate_180` / `flip_vertical` mirror placement (R / F) until the move is confirmed.
+fn build_column_group_remap(
+    selection: &HashSet<ColumnKey>,
+    target_start: i32,
+    proto_cols: i32,
+    rotate_180: bool,
+    flip_vertical: bool,
+) -> Option<HashMap<(ProtoSide, i32), ColumnKey>> {
+    let mut map = HashMap::new();
+    for side in [ProtoSide::Lower, ProtoSide::Upper] {
+        let mut cols: Vec<i32> = selection
+            .iter()
+            .filter(|k| k.side == side)
+            .map(|k| k.col)
+            .collect();
+        cols.sort_unstable();
+        cols.dedup();
+        let k = cols.len();
+        if k == 0 {
+            continue;
+        }
+        let min_c = cols[0];
+        let max_c = cols[k - 1];
+        let span = max_c - min_c;
+        if target_start < 0 || target_start + span > proto_cols {
+            return None;
+        }
+        for &old_c in cols.iter() {
+            let dest = match (rotate_180, flip_vertical) {
+                (false, false) => ColumnKey {
+                    side,
+                    col: target_start + (old_c - min_c),
+                },
+                (false, true) => ColumnKey {
+                    side: side.other(),
+                    col: target_start + (old_c - min_c),
+                },
+                (true, false) => ColumnKey {
+                    side: side.other(),
+                    col: target_start + (max_c - old_c),
+                },
+                (true, true) => ColumnKey {
+                    side,
+                    col: target_start + (max_c - old_c),
+                },
+            };
+            map.insert((side, old_c), dest);
+        }
+    }
+    if map.is_empty() {
+        return None;
+    }
+    let mut seen: HashSet<(ProtoSide, i32)> = HashSet::new();
+    for dest in map.values() {
+        if !seen.insert((dest.side, dest.col)) {
+            return None;
+        }
+    }
+    Some(map)
+}
+
+fn column_remap_to_side_col(
+    m: &HashMap<(ProtoSide, i32), ColumnKey>,
+) -> HashMap<(ProtoSide, i32), (ProtoSide, i32)> {
+    m.iter()
+        .map(|(&k, v)| (k, (v.side, v.col)))
+        .collect()
+}
+
+fn validate_column_group_move(
+    connections: &[Connection],
+    col_remap: &HashMap<(ProtoSide, i32), ColumnKey>,
+) -> Result<(), String> {
+    let mut dest_positions: HashSet<(ProtoSide, i32)> = HashSet::new();
+    for dest in col_remap.values() {
+        dest_positions.insert((dest.side, dest.col));
+    }
+    let mut moving: HashMap<ProtoSide, HashSet<i32>> = HashMap::new();
+    for (&(side, old_c), _) in col_remap {
+        moving.entry(side).or_default().insert(old_c);
+    }
+    for conn in connections {
+        for t in [&conn.a, &conn.b] {
+            match t {
+                ProtomatrixTarget::Pad { side, col, .. }
+                | ProtomatrixTarget::SolderJumper { side, col, .. } => {
+                    if moving.get(side).map_or(false, |s| s.contains(col)) {
+                        continue;
+                    }
+                    if dest_positions.contains(&(*side, *col)) {
+                        return Err(
+                            "Target overlaps another net (no merge). Pick a different column."
+                                .to_string(),
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+fn remap_pad_endpoint(
+    t: &ProtomatrixTarget,
+    col_remap: &HashMap<(ProtoSide, i32), ColumnKey>,
+) -> ProtomatrixTarget {
+    match t {
+        ProtomatrixTarget::Pad {
+            side,
+            col,
+            row,
+        } => {
+            if let Some(dest) = col_remap.get(&(*side, *col)) {
+                ProtomatrixTarget::Pad {
+                    side: dest.side,
+                    col: dest.col,
+                    row: *row,
+                }
+            } else {
+                t.clone()
+            }
+        }
+        ProtomatrixTarget::SolderJumper {
+            side,
+            col,
+            row,
+        } => {
+            if let Some(dest) = col_remap.get(&(*side, *col)) {
+                ProtomatrixTarget::SolderJumper {
+                    side: dest.side,
+                    col: dest.col,
+                    row: *row,
+                }
+            } else {
+                t.clone()
+            }
+        }
+        _ => t.clone(),
+    }
+}
+
+fn remap_metadata_keys<V: Clone>(
+    map: &mut HashMap<String, V>,
+    col_remap: &HashMap<(ProtoSide, i32), ColumnKey>,
+    merge: impl Fn(V, V) -> V,
+) {
+    let mut out: HashMap<String, V> = HashMap::new();
+    for (k, v) in map.drain() {
+        let nk = column_key_from_string(&k)
+            .and_then(|ck| {
+                col_remap
+                    .get(&(ck.side, ck.col))
+                    .map(|dest| column_key_to_string(dest))
+            })
+            .unwrap_or_else(|| k.clone());
+        match out.remove(&nk) {
+            None => {
+                out.insert(nk, v);
+            }
+            Some(old) => {
+                out.insert(nk, merge(old, v));
+            }
+        }
+    }
+    *map = out;
+}
+
+/// Column index under the pointer for placing a moved block (pad/jumper column, else x snap).
+fn target_column_index_from_pointer(
+    config: &ProtomatrixConfig,
+    pointer_mm: egui::Vec2,
+) -> Option<i32> {
+    if let Some(t) = protomatrix::hit_test(config, pointer_mm.x, pointer_mm.y) {
+        match t {
+            ProtomatrixTarget::Pad { col, .. } | ProtomatrixTarget::SolderJumper { col, .. } => {
+                return Some(col);
+            }
+            ProtomatrixTarget::MatrixRow { .. } => {}
+        }
+    }
+    let pitch = config.proto_pitch_mm;
+    let cols = config.proto_area.0;
+    let col_f = (pointer_mm.x / pitch).round();
+    if col_f >= 0.0 && col_f < cols as f32 {
+        Some(col_f as i32)
+    } else {
+        None
+    }
+}
+
+fn apply_column_group_move(
+    connections: &mut Vec<Connection>,
+    net_names: &mut HashMap<String, String>,
+    net_colors: &mut HashMap<String, [u8; 4]>,
+    net_row_pins: &mut HashMap<String, i32>,
+    column_annotations: &mut HashMap<String, String>,
+    selection: &HashSet<ColumnKey>,
+    target_start: i32,
+    proto_cols: i32,
+    rotate_180: bool,
+    flip_vertical: bool,
+) -> Result<(), String> {
+    let col_remap = build_column_group_remap(
+        selection,
+        target_start,
+        proto_cols,
+        rotate_180,
+        flip_vertical,
+    )
+    .ok_or_else(|| "Not enough room for that many columns in that direction.".to_string())?;
+    validate_column_group_move(connections, &col_remap)?;
+    for c in connections.iter_mut() {
+        c.a = remap_pad_endpoint(&c.a, &col_remap);
+        c.b = remap_pad_endpoint(&c.b, &col_remap);
+    }
+    remap_metadata_keys(net_names, &col_remap, |a, b| {
+        if a.trim().is_empty() {
+            b
+        } else {
+            a
+        }
+    });
+    remap_metadata_keys(net_colors, &col_remap, |a, _| a);
+    remap_metadata_keys(net_row_pins, &col_remap, |a, _| a);
+    remap_metadata_keys(column_annotations, &col_remap, |a, b| {
+        if a.trim().is_empty() {
+            b
+        } else {
+            a
+        }
+    });
+    Ok(())
 }
 
 /// Column (side, col) from a target; None for MatrixRow.
@@ -995,6 +1347,7 @@ impl eframe::App for CanvasApp {
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
+            self.column_move_preview_error = None;
             ui.set_min_size(ui.available_size());
             let (x_min, x_max, y_min, y_max) =
                 protomatrix::board_bounds_mm(&self.protomatrix_config);
@@ -1014,6 +1367,9 @@ impl eframe::App for CanvasApp {
                 .union(egui::Sense::drag())
                 .union(egui::Sense::hover());
             let response = ui.allocate_rect(rect, sense);
+            if response.clicked() {
+                response.request_focus();
+            }
 
             // Pan: middle or right mouse drag (round to pixel to avoid sub-pixel jitter)
             if response.dragged_by(egui::PointerButton::Middle)
@@ -1060,40 +1416,122 @@ impl eframe::App for CanvasApp {
                 )
             });
 
-            // Start connection drag when pressing on a pad
+            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                self.column_move_pending = None;
+                self.column_pins_rotated_180 = false;
+                self.column_pins_flip_vertical = false;
+                self.column_move_preview_error = None;
+                self.rect_select_drag = None;
+                self.just_completed_column_marquee = false;
+                self.clear_column_marquee_selection();
+            }
+
+            let dialogs_open = self.show_rename_net_dialog.is_some()
+                || self.show_annotate_dialog.is_some()
+                || self.show_set_size_dialog;
+            // R / F only adjust preview during Move pins… (board updates on Enter / click).
+            if !dialogs_open && self.editing_annotation.is_none() {
+                if self.column_move_pending.is_some() {
+                    if ui.input(|i| i.key_pressed(egui::Key::R)) {
+                        self.column_pins_rotated_180 = !self.column_pins_rotated_180;
+                        ctx.request_repaint();
+                    }
+                    if ui.input(|i| i.key_pressed(egui::Key::F)) {
+                        self.column_pins_flip_vertical = !self.column_pins_flip_vertical;
+                        ctx.request_repaint();
+                    }
+                    if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        if self.try_complete_column_move(pointer_mm) {
+                            ctx.request_repaint();
+                        }
+                    }
+                } else if self.rect_select_drag.is_none()
+                    && ui.input(|i| i.key_pressed(egui::Key::M))
+                {
+                    let cols = self.columns_for_move_hotkey();
+                    if !cols.is_empty() {
+                        self.column_pins_rotated_180 = false;
+                        self.column_pins_flip_vertical = false;
+                        self.column_move_pending = Some(cols);
+                        ctx.request_repaint();
+                    }
+                }
+            }
+
+            // Start connection drag when pressing on a pad (Ctrl+drag = column marquee, no rectangle drawn)
             if ui.input(|i| i.pointer.primary_pressed()) {
-                let mut started_drag = false;
-                if let Some(target) = pointer_mm.and_then(|p| protomatrix::hit_test(&self.protomatrix_config, p.x, p.y)) {
-                    if matches!(target, ProtomatrixTarget::Pad { .. }) {
-                        self.connection_error_preview = None;
-                        self.autoroute_error = None;
-                        self.connection_drag_source = Some(target);
-                        started_drag = true;
-                    } else {
-                        let row = match &target {
-                            ProtomatrixTarget::MatrixRow { row, .. } => Some(*row),
-                            ProtomatrixTarget::SolderJumper { row, .. } => Some(*row),
-                            _ => None,
-                        };
-                        if let (Some(row), Some(js)) = (row, self.jumper_state.as_ref()) {
-                            if let Some(net_idx) = js.net_for_row(row) {
-                                self.row_drag_source = Some((row, net_idx));
-                                started_drag = true;
+                let ctrl = ui.input(|i| i.modifiers.ctrl);
+                if ctrl && self.column_move_pending.is_none() {
+                    if let Some(pos) = response.hover_pos() {
+                        self.rect_select_drag = Some((pos, pos));
+                    }
+                } else if self.column_move_pending.is_none() && self.rect_select_drag.is_none() {
+                    let mut started_drag = false;
+                    if let Some(target) =
+                        pointer_mm.and_then(|p| protomatrix::hit_test(&self.protomatrix_config, p.x, p.y))
+                    {
+                        if matches!(target, ProtomatrixTarget::Pad { .. }) {
+                            self.connection_error_preview = None;
+                            self.autoroute_error = None;
+                            self.connection_drag_source = Some(target);
+                            started_drag = true;
+                        } else {
+                            let row = match &target {
+                                ProtomatrixTarget::MatrixRow { row, .. } => Some(*row),
+                                ProtomatrixTarget::SolderJumper { row, .. } => Some(*row),
+                                _ => None,
+                            };
+                            if let (Some(row), Some(js)) = (row, self.jumper_state.as_ref()) {
+                                if let Some(net_idx) = js.net_for_row(row) {
+                                    self.row_drag_source = Some((row, net_idx));
+                                    started_drag = true;
+                                }
+                            }
+                        }
+                    }
+                    if !started_drag {
+                        if let Some(ptr) = pointer_mm {
+                            if let Some(idx) = self.annotation_index_at(ptr, scale, ui) {
+                                self.annotation_drag_source = Some(idx);
                             }
                         }
                     }
                 }
-                if !started_drag {
-                    if let Some(ptr) = pointer_mm {
-                        if let Some(idx) = self.annotation_index_at(ptr, scale, ui) {
-                            self.annotation_drag_source = Some(idx);
-                        }
-                    }
+            }
+            if let Some((_, ref mut end)) = self.rect_select_drag {
+                if let Some(pos) = response.hover_pos() {
+                    *end = pos;
                 }
             }
             // Complete or cancel connection drag on release
             if ui.input(|i| i.pointer.primary_released()) {
-                if let Some((source_row, source_net_idx)) = self.row_drag_source.take() {
+                if let Some((a, b)) = self.rect_select_drag.take() {
+                    self.just_completed_column_marquee = true;
+                    let to_mm = |p: egui::Pos2| -> egui::Vec2 {
+                        egui::vec2(
+                            (p.x - origin.x - self.pan.x) / scale,
+                            (p.y - origin.y - self.pan.y) / scale,
+                        )
+                    };
+                    let ma = to_mm(a);
+                    let mb = to_mm(b);
+                    let mut sel = columns_in_rect_mm(
+                        &self.protomatrix_config,
+                        ma.x,
+                        ma.y,
+                        mb.x,
+                        mb.y,
+                    );
+                    if let Some(ref js) = self.jumper_state {
+                        let ms = self.protomatrix_config.matrix_size;
+                        sel.retain(|ck| js.net_for_column(ck.side, ck.col, ms).is_some());
+                    } else {
+                        sel.clear();
+                    }
+                    self.column_selection = sel;
+                } else if self.column_move_pending.is_some() {
+                    self.try_complete_column_move(pointer_mm);
+                } else if let Some((source_row, source_net_idx)) = self.row_drag_source.take() {
                     // Row drag: swap nets if dropped on a different row
                     let target_row = pointer_mm
                         .and_then(|p| protomatrix::hit_test(&self.protomatrix_config, p.x, p.y))
@@ -1161,6 +1599,8 @@ impl eframe::App for CanvasApp {
                 primary_clicked,
                 &mut self.protomatrix_state,
             );
+            let skip_marquee_clear = self.just_completed_column_marquee;
+            self.just_completed_column_marquee = false;
             // Right-click context menu: Disconnect column from net, Annotate column
             let matrix_size = self.protomatrix_config.matrix_size;
             let context_col = pointer_mm
@@ -1179,15 +1619,18 @@ impl eframe::App for CanvasApp {
                     self.context_menu_annotation = Some(idx);
                     self.context_menu_column = None;
                     self.context_menu_column_with_net = None;
+                    self.context_menu_column_selection = false;
                 } else {
                     self.context_menu_annotation = None;
                     self.context_menu_column = context_col;
                     self.context_menu_column_with_net = context_col_with_net;
+                    self.context_menu_column_selection = !self.column_selection.is_empty();
                 }
             } else if !response.context_menu_opened() {
                 self.context_menu_column = None;
                 self.context_menu_column_with_net = None;
                 self.context_menu_annotation = None;
+                self.context_menu_column_selection = false;
             }
             let disconnect_id = egui::Id::new("protomatrix_disconnect_column");
             let remove_annotation_id = egui::Id::new("remove_floating_annotation");
@@ -1197,83 +1640,127 @@ impl eframe::App for CanvasApp {
                         ui.data_mut(|d| d.insert_temp(remove_annotation_id, Some(idx)));
                         ui.close();
                     }
-                } else if let Some(col) = self.context_menu_column {
-                    if self.context_menu_column_with_net == Some(col) {
+                } else {
+                    let col = self.context_menu_column;
+                    let matrix_size = self.protomatrix_config.matrix_size;
+                    let cols_for_move: HashSet<ColumnKey> = if !self.column_selection.is_empty() {
+                        self.column_selection.clone()
+                    } else if let Some(c) = col {
+                        [c].into_iter().collect()
+                    } else {
+                        HashSet::new()
+                    };
+                    let mut disconnect_targets: Vec<ColumnKey> = if !self.column_selection.is_empty() {
+                        self.column_selection.iter().copied().collect()
+                    } else if let Some(c) = col {
+                        vec![c]
+                    } else {
+                        vec![]
+                    };
+                    disconnect_targets.sort_unstable();
+                    let show_disconnect = !disconnect_targets.is_empty()
+                        && self.jumper_state.as_ref().map_or(false, |js| {
+                            disconnect_targets.iter().any(|ck| {
+                                js.net_for_column(ck.side, ck.col, matrix_size).is_some()
+                            })
+                        });
+                    if show_disconnect {
                         if ui.button("Disconnect").clicked() {
-                            ui.data_mut(|d| d.insert_temp(disconnect_id, Some(col)));
+                            ui.data_mut(|d| {
+                                d.insert_temp(disconnect_id, Some(disconnect_targets.clone()))
+                            });
                             ui.close();
                         }
-                        if ui.button("Edit NET").clicked() {
-                            let matrix_size = self.protomatrix_config.matrix_size;
-                            if let (Some(ni), Some(js)) = (
-                                self.jumper_state.as_ref().and_then(|js| js.net_for_column(col.side, col.col, matrix_size)),
-                                self.jumper_state.as_ref(),
-                            ) {
-                                if let Some(ck) = js.net_canonical_keys.get(ni) {
-                                    let key = column_key_to_string(ck);
-                                    self.show_rename_net_dialog = Some(key.clone());
-                                    self.rename_net_name = self
-                                        .net_names
-                                        .get(&key)
-                                        .cloned()
-                                        .unwrap_or_else(|| format!("Net {}", ni));
-                                    ui.close();
-                                }
+                    }
+                    if let Some(col) = col {
+                        if self.context_menu_column_with_net == Some(col) {
+                            if show_disconnect {
+                                ui.separator();
                             }
-                        }
-                        ui.separator();
-                    }
-                    if ui.button("Annotate").clicked() {
-                        let key = column_key_to_string(&col);
-                        self.annotate_column_text = self
-                            .column_annotations
-                            .get(&key)
-                            .cloned()
-                            .unwrap_or_default();
-                        self.show_annotate_dialog = Some(col);
-                        ui.close();
-                    }
-                    if self.context_menu_column_with_net == Some(col) {
-                        ui.separator();
-                        ui.menu_button("Change color", |ui| {
-                        let matrix_size = self.protomatrix_config.matrix_size;
-                        let net_idx = self
-                            .jumper_state
-                            .as_ref()
-                            .and_then(|js| js.net_for_column(col.side, col.col, matrix_size));
-                        if let (Some(net_idx), Some(js)) = (net_idx, self.jumper_state.as_ref()) {
-                            if let Some(canonical_key) = js.net_canonical_keys.get(net_idx) {
-                                let key_str = column_key_to_string(canonical_key);
-                                let default_color =
-                                    protomatrix::net_color(net_idx);
-                                let mut color = self
-                                    .net_colors
-                                    .get(&key_str)
-                                    .map(|rgba| {
-                                        egui::Color32::from_rgba_unmultiplied(
-                                            rgba[0], rgba[1], rgba[2], rgba[3],
-                                        )
-                                    })
-                                    .unwrap_or(default_color);
-                                if egui::widgets::color_picker::color_picker_color32(
-                                    ui,
-                                    &mut color,
-                                    egui::widgets::color_picker::Alpha::Opaque,
+                            if ui.button("Edit NET").clicked() {
+                                if let (Some(ni), Some(js)) = (
+                                    self.jumper_state.as_ref().and_then(|js| {
+                                        js.net_for_column(col.side, col.col, matrix_size)
+                                    }),
+                                    self.jumper_state.as_ref(),
                                 ) {
-                                    let rgba = color.to_srgba_unmultiplied();
-                                    self.net_colors
-                                        .insert(key_str.clone(), [rgba[0], rgba[1], rgba[2], rgba[3]]);
-                                }
-                                if ui.button("Reset to default").clicked() {
-                                    self.net_colors.remove(&key_str);
-                                    ui.close();
+                                    if let Some(ck) = js.net_canonical_keys.get(ni) {
+                                        let key = column_key_to_string(ck);
+                                        self.show_rename_net_dialog = Some(key.clone());
+                                        self.rename_net_name = self
+                                            .net_names
+                                            .get(&key)
+                                            .cloned()
+                                            .unwrap_or_else(|| format!("Net {}", ni));
+                                        ui.close();
+                                    }
                                 }
                             }
                         }
-                    });
+                        if ui.button("Annotate").clicked() {
+                            let key = column_key_to_string(&col);
+                            self.annotate_column_text = self
+                                .column_annotations
+                                .get(&key)
+                                .cloned()
+                                .unwrap_or_default();
+                            self.show_annotate_dialog = Some(col);
+                            ui.close();
+                        }
+                        if self.context_menu_column_with_net == Some(col) {
+                            ui.separator();
+                            ui.menu_button("Change color", |ui| {
+                                let net_idx = self
+                                    .jumper_state
+                                    .as_ref()
+                                    .and_then(|js| js.net_for_column(col.side, col.col, matrix_size));
+                                if let (Some(net_idx), Some(js)) = (net_idx, self.jumper_state.as_ref()) {
+                                    if let Some(canonical_key) = js.net_canonical_keys.get(net_idx) {
+                                        let key_str = column_key_to_string(canonical_key);
+                                        let default_color = protomatrix::net_color(net_idx);
+                                        let mut color = self
+                                            .net_colors
+                                            .get(&key_str)
+                                            .map(|rgba| {
+                                                egui::Color32::from_rgba_unmultiplied(
+                                                    rgba[0], rgba[1], rgba[2], rgba[3],
+                                                )
+                                            })
+                                            .unwrap_or(default_color);
+                                        if egui::widgets::color_picker::color_picker_color32(
+                                            ui,
+                                            &mut color,
+                                            egui::widgets::color_picker::Alpha::Opaque,
+                                        ) {
+                                            let rgba = color.to_srgba_unmultiplied();
+                                            self.net_colors.insert(
+                                                key_str.clone(),
+                                                [rgba[0], rgba[1], rgba[2], rgba[3]],
+                                            );
+                                        }
+                                        if ui.button("Reset to default").clicked() {
+                                            self.net_colors.remove(&key_str);
+                                            ui.close();
+                                        }
+                                    }
+                                }
+                            });
+                        }
                     }
-                } else {
-                    ui.label("(Right-click on pad or jumper to disconnect or annotate)");
+                    if !cols_for_move.is_empty() {
+                        if col.is_some() {
+                            ui.separator();
+                        }
+                        if ui.button("Move pins…").clicked() {
+                            self.column_pins_rotated_180 = false;
+                            self.column_pins_flip_vertical = false;
+                            self.column_move_pending = Some(cols_for_move);
+                            ui.close();
+                        }
+                    }
+                    if col.is_none() && !self.context_menu_column_selection {
+                        ui.label("(Right-click on pad or jumper to disconnect or annotate)");
+                    }
                 }
             });
 
@@ -1338,9 +1825,15 @@ impl eframe::App for CanvasApp {
                 self.selected_net = net_idx;
                 // Single click: selection only (connections use drag)
                 self.last_clicked = Some(t.clone());
+                if !skip_marquee_clear {
+                    self.clear_column_marquee_selection();
+                }
             } else if primary_clicked {
                 // Clicked on empty space: clear selection
                 self.selected_net = None;
+                if !skip_marquee_clear {
+                    self.clear_column_marquee_selection();
+                }
             }
 
             let to_screen = |x_mm: f32, y_mm: f32| -> egui::Pos2 {
@@ -1364,6 +1857,23 @@ impl eframe::App for CanvasApp {
                 egui::Stroke::new(1.5, OUTLINE_COLOR),
                 egui::StrokeKind::Outside,
             );
+            if let Some((a, b)) = self.rect_select_drag {
+                let marquee_rect = egui::Rect::from_two_pos(a, b);
+                painter.rect_filled(
+                    marquee_rect,
+                    egui::CornerRadius::ZERO,
+                    egui::Color32::from_rgba_unmultiplied(120, 180, 255, 45),
+                );
+                painter.rect_stroke(
+                    marquee_rect,
+                    egui::CornerRadius::ZERO,
+                    egui::Stroke::new(
+                        1.0,
+                        egui::Color32::from_rgb(180, 210, 255),
+                    ),
+                    egui::StrokeKind::Outside,
+                );
+            }
             let net_color_override = self
                 .jumper_state
                 .as_ref()
@@ -1407,6 +1917,70 @@ impl eframe::App for CanvasApp {
                 color_override_ref,
                 self.selected_net,
             );
+            let column_sel_tuples: HashSet<(ProtoSide, i32)> = self
+                .column_selection
+                .iter()
+                .map(|k| (k.side, k.col))
+                .collect();
+            if self.column_move_pending.is_none() {
+                protomatrix::draw_column_selection_net_outlines(
+                    &self.protomatrix_config,
+                    &painter,
+                    &to_screen,
+                    scale,
+                    view,
+                    &column_sel_tuples,
+                    self.jumper_state.as_ref(),
+                    color_override_ref,
+                    self.selected_net,
+                );
+            }
+            if let Some(ref pending) = self.column_move_pending {
+                if let Some(ptr) = pointer_mm {
+                    if let Some(ts) =
+                        target_column_index_from_pointer(&self.protomatrix_config, ptr)
+                    {
+                        let proto_cols = self.protomatrix_config.proto_area.0;
+                        match build_column_group_remap(
+                            pending,
+                            ts,
+                            proto_cols,
+                            self.column_pins_rotated_180,
+                            self.column_pins_flip_vertical,
+                        ) {
+                            Some(m) => {
+                                let validation =
+                                    validate_column_group_move(&self.connections, &m);
+                                let collision = validation.is_err();
+                                if let Err(e) = validation {
+                                    self.column_move_preview_error = Some(e);
+                                }
+                                let tuples = column_remap_to_side_col(&m);
+                                let src_tuples: HashSet<(ProtoSide, i32)> =
+                                    pending.iter().map(|k| (k.side, k.col)).collect();
+                                protomatrix::draw_column_move_preview_net_outlines(
+                                    &self.protomatrix_config,
+                                    &painter,
+                                    &to_screen,
+                                    scale,
+                                    view,
+                                    &src_tuples,
+                                    &tuples,
+                                    collision,
+                                    self.jumper_state.as_ref(),
+                                    color_override_ref,
+                                    self.selected_net,
+                                );
+                            }
+                            None => {
+                                self.column_move_preview_error = Some(
+                                    "Not enough room for that block in that direction.".into(),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
             protomatrix::draw_matrix_areas(
                 &self.protomatrix_config,
                 &painter,
@@ -1566,8 +2140,8 @@ impl eframe::App for CanvasApp {
 
             if self.annotation_drag_source.is_some() {
                 ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
-            } else             if self.annotation_drag_source.is_some() {
-                ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+            } else if self.column_move_pending.is_some() {
+                ctx.set_cursor_icon(egui::CursorIcon::Move);
             } else if self.row_drag_source.is_some() {
                 ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
             } else if response.dragged() {
@@ -1655,22 +2229,31 @@ impl eframe::App for CanvasApp {
             }
 
             // Process Disconnect from context menu (remove_temp consumes so we only process once)
-            if let Some(col) = ctx.data_mut(|d| d.remove_temp::<Option<ColumnKey>>(disconnect_id)).flatten() {
-                if let Some(ref js) = self.jumper_state {
-                    migrate_disconnected_column_metadata(
-                        col,
-                        js,
-                        self.protomatrix_config.matrix_size,
-                        &mut self.net_names,
-                        &mut self.net_colors,
-                        &mut self.net_row_pins,
-                    );
+            if let Some(cols) = ctx
+                .data_mut(|d| d.remove_temp::<Option<Vec<ColumnKey>>>(disconnect_id))
+                .flatten()
+            {
+                if !cols.is_empty() {
+                    let matrix_size = self.protomatrix_config.matrix_size;
+                    for col in cols {
+                        if let Some(ref js) = self.jumper_state {
+                            migrate_disconnected_column_metadata(
+                                col,
+                                js,
+                                matrix_size,
+                                &mut self.net_names,
+                                &mut self.net_colors,
+                                &mut self.net_row_pins,
+                            );
+                        }
+                        disconnect_column(&mut self.connections, col);
+                        self.run_autoroute();
+                    }
+                    self.connection_drag_source = None;
+                    self.selected_net = None;
+                    self.context_menu_column = None;
+                    self.clear_column_marquee_selection();
                 }
-                disconnect_column(&mut self.connections, col);
-                self.connection_drag_source = None;
-                self.selected_net = None;
-                self.context_menu_column = None;
-                self.run_autoroute();
             }
             // Process Remove from floating annotation context menu
             if let Some(idx) = ctx.data_mut(|d| d.remove_temp::<Option<usize>>(remove_annotation_id)).flatten() {
@@ -1745,6 +2328,25 @@ impl eframe::App for CanvasApp {
                 if self.row_drag_source.is_some() {
                     ui.label("(drag to row to swap nets)");
                 }
+                if self.column_move_pending.is_some() {
+                    ui.label("(hover column; Enter or click board to place)");
+                    ui.weak("| R rotate 180° | F flip preview");
+                    if self.column_pins_rotated_180 {
+                        ui.label("(180°)");
+                    }
+                    if self.column_pins_flip_vertical {
+                        ui.label("(flip)");
+                    }
+                }
+                if !self.column_selection.is_empty() {
+                    ui.label(format!(
+                        "| {} column(s) selected (Ctrl+drag)",
+                        self.column_selection.len()
+                    ));
+                }
+                if let Some(ref ce) = self.column_move_preview_error {
+                    ui.colored_label(egui::Color32::RED, ce);
+                }
                 if let Some(ref err) = self.autoroute_error {
                     ui.colored_label(egui::Color32::RED, err);
                 } else {
@@ -1766,8 +2368,58 @@ impl eframe::App for CanvasApp {
                     self.jumper_state = None;
                     self.autoroute_error = None;
                     self.selected_net = None;
+                    self.clear_column_marquee_selection();
+                    self.column_move_pending = None;
+                    self.column_pins_rotated_180 = false;
+                    self.column_pins_flip_vertical = false;
+                    self.column_move_preview_error = None;
+                    self.rect_select_drag = None;
+                    self.just_completed_column_marquee = false;
                 }
             });
         });
+
+        egui::Area::new(egui::Id::new("hotkeys_overlay"))
+            .order(egui::Order::Foreground)
+            .anchor(
+                egui::Align2::RIGHT_TOP,
+                egui::vec2(-12.0, 12.0 + ctx.style().spacing.menu_margin.sum().y + 2.0),
+            )
+            .movable(false)
+            .interactable(false)
+            .show(ctx, |ui| {
+                egui::Frame::default()
+                    .fill(egui::Color32::from_rgba_unmultiplied(28, 32, 38, 230))
+                    .stroke(egui::Stroke::new(
+                        1.0,
+                        egui::Color32::from_rgba_unmultiplied(70, 78, 90, 255),
+                    ))
+                    .corner_radius(egui::CornerRadius::same(6))
+                    .inner_margin(egui::Margin::same(10))
+                    .show(ui, |ui| {
+                        ui.set_max_width(260.0);
+                        ui.label(
+                            egui::RichText::new("Shortcuts").strong().size(13.5),
+                        );
+                        ui.add_space(4.0);
+                        let mono = |s: &str| {
+                            egui::RichText::new(s)
+                                .font(egui::FontId::monospace(12.0))
+                                .color(egui::Color32::from_rgb(200, 220, 255))
+                        };
+                        let line = |ui: &mut egui::Ui, key: &str, desc: &str| {
+                            ui.horizontal(|ui| {
+                                ui.label(mono(key));
+                                ui.label(desc);
+                            });
+                        };
+                        line(ui, "Ctrl+drag", "Select columns (routed nets)");
+                        line(ui, "M", "Move pins…");
+                        line(ui, "Esc", "Cancel move / clear selection");
+                        line(ui, "R / F", "Rotate / flip preview (while moving)");
+                        line(ui, "Enter", "Place pins (with hover position)");
+                        line(ui, "Click", "Place pins (anywhere on board)");
+                    });
+            });
     }
 }

@@ -3,6 +3,8 @@
 //! Provides hit-testing and events for mouse over and mouse clicks on pads,
 //! matrix rows, and solder jumpers.
 
+use std::collections::HashMap;
+
 use eframe::egui;
 use serde::{Deserialize, Serialize};
 
@@ -11,6 +13,17 @@ use serde::{Deserialize, Serialize};
 pub enum ProtoSide {
     Lower,
     Upper,
+}
+
+impl ProtoSide {
+    /// The opposite face of the board (upper ↔ lower proto).
+    #[inline]
+    pub const fn other(self) -> Self {
+        match self {
+            Self::Lower => Self::Upper,
+            Self::Upper => Self::Lower,
+        }
+    }
 }
 
 /// Target element under the cursor or clicked.
@@ -426,6 +439,40 @@ fn track_color() -> egui::Color32 {
     egui::Color32::from_rgba_unmultiplied(128, 128, 128, 140)
 }
 
+/// (side, col) → net index for proto columns that have matrix connectivity (same as jumper rings).
+fn proto_column_net_indices<J: JumperStateProvider + ?Sized>(
+    config: &ProtomatrixConfig,
+    js: &J,
+) -> HashMap<(ProtoSide, i32), usize> {
+    let mut col_net = HashMap::new();
+    for side in [ProtoSide::Lower, ProtoSide::Upper] {
+        for col in 0..config.proto_area.0 {
+            for matrix_row in 0..config.matrix_size {
+                if let Some(net_idx) = js.net_index(side, col, matrix_row) {
+                    col_net.insert((side, col), net_idx);
+                    break;
+                }
+            }
+        }
+    }
+    col_net
+}
+
+fn net_color_for_ring(
+    net_idx: usize,
+    net_color_override: Option<&dyn Fn(usize) -> egui::Color32>,
+    selected_net: Option<usize>,
+) -> egui::Color32 {
+    let base = net_color_override
+        .map(|f| f(net_idx))
+        .unwrap_or_else(|| net_color(net_idx));
+    match selected_net {
+        Some(sel) if sel == net_idx => net_color_highlight(base),
+        Some(_) => net_color_dimmed(base),
+        None => base,
+    }
+}
+
 /// Net color with transparency (for Y tracks and y connecting tracks).
 fn net_color_transparent(
     net_color: egui::Color32,
@@ -449,6 +496,117 @@ fn segment_in_view(x0: f32, y0: f32, x1: f32, y1: f32, v: (f32, f32, f32, f32)) 
     let (sx0, sx1) = (x0.min(x1), x0.max(x1));
     let (sy0, sy1) = (y0.min(y1), y0.max(y1));
     sx1 >= v.0 && sx0 <= v.1 && sy1 >= v.2 && sy0 <= v.3
+}
+
+/// Column marquee selection: 1px rings on proto pads that belong to a net, using net color.
+pub fn draw_column_selection_net_outlines<J: JumperStateProvider + ?Sized>(
+    config: &ProtomatrixConfig,
+    painter: &egui::Painter,
+    to_screen: &impl Fn(f32, f32) -> egui::Pos2,
+    scale: f32,
+    view: (f32, f32, f32, f32),
+    selected_columns: &std::collections::HashSet<(ProtoSide, i32)>,
+    jumper_state: Option<&J>,
+    net_color_override: Option<&dyn Fn(usize) -> egui::Color32>,
+    selected_net: Option<usize>,
+) {
+    let Some(js) = jumper_state else {
+        return;
+    };
+    let col_net = proto_column_net_indices(config, js);
+    let r_mm = config.proto_pad_dia_mm / 2.0;
+    // Extra screen px so the ring clears the copper fill (avoids color blending).
+    let radius_px = r_mm * scale + 5.5;
+    let pitch = config.proto_pitch_mm;
+    for &(side, col) in selected_columns {
+        let Some(&net_idx) = col_net.get(&(side, col)) else {
+            continue;
+        };
+        let color = net_color_for_ring(net_idx, net_color_override, selected_net);
+        let stroke = egui::Stroke::new(1.25, color);
+        match side {
+            ProtoSide::Lower => {
+                for j in 0..config.proto_area.1 {
+                    let x = col as f32 * pitch;
+                    let y = j as f32 * pitch;
+                    if !in_view(x, y, view) {
+                        continue;
+                    }
+                    painter.circle_stroke(to_screen(x, y), radius_px, stroke);
+                }
+            }
+            ProtoSide::Upper => {
+                for j in 0..config.proto_area.1 {
+                    let x = col as f32 * pitch;
+                    let y = -config.proto_gap_mm - j as f32 * pitch;
+                    if !in_view(x, y, view) {
+                        continue;
+                    }
+                    painter.circle_stroke(to_screen(x, y), radius_px, stroke);
+                }
+            }
+        }
+    }
+}
+
+/// Move preview: same as selection rings but drawn at remapped column positions using source nets' colors.
+/// `col_remap` maps (source side, col) → (destination side, col). When `collision_highlight`, draws in red.
+pub fn draw_column_move_preview_net_outlines<J: JumperStateProvider + ?Sized>(
+    config: &ProtomatrixConfig,
+    painter: &egui::Painter,
+    to_screen: &impl Fn(f32, f32) -> egui::Pos2,
+    scale: f32,
+    view: (f32, f32, f32, f32),
+    source_columns: &std::collections::HashSet<(ProtoSide, i32)>,
+    col_remap: &HashMap<(ProtoSide, i32), (ProtoSide, i32)>,
+    collision_highlight: bool,
+    jumper_state: Option<&J>,
+    net_color_override: Option<&dyn Fn(usize) -> egui::Color32>,
+    selected_net: Option<usize>,
+) {
+    let Some(js) = jumper_state else {
+        return;
+    };
+    let col_net = proto_column_net_indices(config, js);
+    let r_mm = config.proto_pad_dia_mm / 2.0;
+    let radius_px = r_mm * scale + 5.5;
+    let pitch = config.proto_pitch_mm;
+    for &(side, old_c) in source_columns {
+        let Some(&(dest_side, dest_col)) = col_remap.get(&(side, old_c)) else {
+            continue;
+        };
+        let Some(&net_idx) = col_net.get(&(side, old_c)) else {
+            continue;
+        };
+        let color = if collision_highlight {
+            egui::Color32::RED
+        } else {
+            net_color_for_ring(net_idx, net_color_override, selected_net)
+        };
+        let stroke = egui::Stroke::new(if collision_highlight { 1.75 } else { 1.25 }, color);
+        match dest_side {
+            ProtoSide::Lower => {
+                for j in 0..config.proto_area.1 {
+                    let x = dest_col as f32 * pitch;
+                    let y = j as f32 * pitch;
+                    if !in_view(x, y, view) {
+                        continue;
+                    }
+                    painter.circle_stroke(to_screen(x, y), radius_px, stroke);
+                }
+            }
+            ProtoSide::Upper => {
+                for j in 0..config.proto_area.1 {
+                    let x = dest_col as f32 * pitch;
+                    let y = -config.proto_gap_mm - j as f32 * pitch;
+                    if !in_view(x, y, view) {
+                        continue;
+                    }
+                    painter.circle_stroke(to_screen(x, y), radius_px, stroke);
+                }
+            }
+        }
+    }
 }
 
 fn draw_solder_jumper_pad(
@@ -496,36 +654,14 @@ pub fn draw_proto_jumper_indicators<J: JumperStateProvider + ?Sized>(
     let Some(js) = jumper_state else {
         return;
     };
-    // Build (side, col) -> net_index from closed jumpers (JumperStateProvider has no iter, so we probe)
-    let mut col_net: std::collections::HashMap<(ProtoSide, i32), usize> =
-        std::collections::HashMap::new();
-    for side in [ProtoSide::Lower, ProtoSide::Upper] {
-        for col in 0..config.proto_area.0 {
-            for matrix_row in 0..config.matrix_size {
-                if let Some(net_idx) = js.net_index(side, col, matrix_row) {
-                    col_net.insert((side, col), net_idx);
-                    break; // one jumper per column per net
-                }
-            }
-        }
-    }
+    let col_net = proto_column_net_indices(config, js);
     let pad_r = config.proto_pad_dia_mm / 2.0;
     let base_stroke = (0.3_f32).max(config.track_width_mm * 0.6) * scale;
     let highlight_stroke = base_stroke * 1.15; // subtle thickness increase
-    let color_for = |net_idx: usize| {
-        let base = net_color_override
-            .map(|f| f(net_idx))
-            .unwrap_or_else(|| net_color(net_idx));
-        match selected_net {
-            Some(sel) if sel == net_idx => net_color_highlight(base),
-            Some(_) => net_color_dimmed(base),
-            None => base,
-        }
-    };
     // Lower proto area
     for i in 0..config.proto_area.0 {
         if let Some(&net_idx) = col_net.get(&(ProtoSide::Lower, i)) {
-            let color = color_for(net_idx);
+            let color = net_color_for_ring(net_idx, net_color_override, selected_net);
             let stroke_w = if selected_net == Some(net_idx) {
                 highlight_stroke
             } else {
@@ -545,7 +681,7 @@ pub fn draw_proto_jumper_indicators<J: JumperStateProvider + ?Sized>(
     // Upper proto area
     for i in 0..config.proto_area.0 {
         if let Some(&net_idx) = col_net.get(&(ProtoSide::Upper, i)) {
-            let color = color_for(net_idx);
+            let color = net_color_for_ring(net_idx, net_color_override, selected_net);
             let stroke_w = if selected_net == Some(net_idx) {
                 highlight_stroke
             } else {

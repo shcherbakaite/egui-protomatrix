@@ -140,6 +140,7 @@ impl JumperState {
             .find(|(&(_, _, r), _)| r == row)
             .map(|(_, &ni)| ni)
     }
+
 }
 
 impl JumperStateProvider for JumperState {
@@ -188,6 +189,45 @@ fn column_key_to_string(col: &ColumnKey) -> String {
         ProtoSide::Upper => 'U',
     };
     format!("{}{}", side, col.col)
+}
+
+/// Proto columns whose pad centers lie inside the axis-aligned rectangle (mm, board coords).
+pub fn columns_in_rect_mm(
+    config: &ProtomatrixConfig,
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+) -> HashSet<ColumnKey> {
+    let (min_x, max_x) = if x0 <= x1 { (x0, x1) } else { (x1, x0) };
+    let (min_y, max_y) = if y0 <= y1 { (y0, y1) } else { (y1, y0) };
+    let mut set = HashSet::new();
+    let pitch = config.proto_pitch_mm;
+    for i in 0..config.proto_area.0 {
+        for j in 0..config.proto_area.1 {
+            let px = i as f32 * pitch;
+            let py = j as f32 * pitch;
+            if px >= min_x && px <= max_x && py >= min_y && py <= max_y {
+                set.insert(ColumnKey {
+                    side: ProtoSide::Lower,
+                    col: i,
+                });
+            }
+        }
+    }
+    for i in 0..config.proto_area.0 {
+        for j in 0..config.proto_area.1 {
+            let px = i as f32 * pitch;
+            let py = -config.proto_gap_mm - j as f32 * pitch;
+            if px >= min_x && px <= max_x && py >= min_y && py <= max_y {
+                set.insert(ColumnKey {
+                    side: ProtoSide::Upper,
+                    col: i,
+                });
+            }
+        }
+    }
+    set
 }
 
 /// Assign nets to matrix rows. Cross-side nets get the same row on both sides.

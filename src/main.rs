@@ -341,6 +341,8 @@ struct CanvasApp {
     connections: Vec<Connection>,
     /// Pad we started dragging from (while creating a connection); line drawn to pointer until release.
     connection_drag_source: Option<ProtomatrixTarget>,
+    /// Failed pad-to-pad attempt: draw red line until cleared (e.g. too many nets).
+    connection_error_preview: Option<(ProtomatrixTarget, ProtomatrixTarget)>,
     /// Autorouter result: which jumpers to close.
     jumper_state: Option<JumperState>,
     /// Autorouter error message (e.g. too many nets).
@@ -426,6 +428,7 @@ impl CanvasApp {
             last_clicked: None,
             connections: Vec::new(),
             connection_drag_source: None,
+            connection_error_preview: None,
             jumper_state: None,
             autoroute_error: None,
             net_names: HashMap::new(),
@@ -456,6 +459,7 @@ impl CanvasApp {
 
     /// Run autoroute, migrate metadata, and re-run if pins were migrated (canonical changed after merge).
     fn run_autoroute(&mut self) {
+        let prev_jumper = self.jumper_state.clone();
         self.autoroute_error = None;
         let matrix_size = self.protomatrix_config.matrix_size;
         let mut result = router::autoroute(
@@ -463,7 +467,9 @@ impl CanvasApp {
             &self.connections,
             Some(&self.net_row_pins),
         );
+        let mut first_ok_js: Option<JumperState> = None;
         if let AutorouteResult::Ok(ref js) = result {
+            first_ok_js = Some(js.clone());
             if migrate_net_metadata_after_autoroute(
                 &mut self.net_names,
                 &mut self.net_colors,
@@ -488,10 +494,13 @@ impl CanvasApp {
             }
         }
         match result {
-            AutorouteResult::Ok(js) => self.jumper_state = Some(js),
+            AutorouteResult::Ok(js) => {
+                self.jumper_state = Some(js);
+                self.connection_error_preview = None;
+            }
             AutorouteResult::Err(e) => {
                 self.autoroute_error = Some(e);
-                self.jumper_state = None;
+                self.jumper_state = first_ok_js.or(prev_jumper);
             }
         }
     }
@@ -509,8 +518,10 @@ impl CanvasApp {
         self.column_annotations = board.column_annotations;
         self.editing_annotation = None;
         self.connection_drag_source = None;
+        self.connection_error_preview = None;
         self.row_drag_source = None;
         self.selected_net = None;
+        self.jumper_state = None;
         self.run_autoroute();
         Ok(())
     }
@@ -613,6 +624,7 @@ impl CanvasApp {
         self.context_menu_annotation = None;
         self.row_drag_source = None;
         self.connection_drag_source = None;
+        self.connection_error_preview = None;
         self.jumper_state = None;
         self.autoroute_error = None;
         self.file_path = None;
@@ -977,6 +989,8 @@ impl eframe::App for CanvasApp {
                 (self.set_size_proto_cols, self.set_size_proto_rows);
             self.protomatrix_config.matrix_size = self.set_size_matrix_size;
             self.protomatrix_config.matrix_break_every = self.set_size_break_every;
+            self.jumper_state = None;
+            self.connection_error_preview = None;
             self.run_autoroute();
         }
 
@@ -1051,6 +1065,8 @@ impl eframe::App for CanvasApp {
                 let mut started_drag = false;
                 if let Some(target) = pointer_mm.and_then(|p| protomatrix::hit_test(&self.protomatrix_config, p.x, p.y)) {
                     if matches!(target, ProtomatrixTarget::Pad { .. }) {
+                        self.connection_error_preview = None;
+                        self.autoroute_error = None;
                         self.connection_drag_source = Some(target);
                         started_drag = true;
                     } else {
@@ -1112,8 +1128,12 @@ impl eframe::App for CanvasApp {
                 } else if let Some(source) = self.connection_drag_source.take() {
                     if let Some(dest) = pointer_mm.and_then(|p| protomatrix::hit_test(&self.protomatrix_config, p.x, p.y)) {
                         if matches!(dest, ProtomatrixTarget::Pad { .. }) && dest != source {
-                            self.connections.push(Connection::new(source, dest));
+                            self.connections.push(Connection::new(source.clone(), dest.clone()));
                             self.run_autoroute();
+                            if self.autoroute_error.is_some() {
+                                self.connections.pop();
+                                self.connection_error_preview = Some((source, dest));
+                            }
                         }
                     }
                 } else {
@@ -1506,6 +1526,17 @@ impl eframe::App for CanvasApp {
                     ptr,
                 );
             }
+            if let Some((ref a, ref b)) = self.connection_error_preview {
+                protomatrix::draw_pad_to_pad_line(
+                    &self.protomatrix_config,
+                    &painter,
+                    &to_screen,
+                    scale,
+                    a,
+                    b,
+                    egui::Color32::RED,
+                );
+            }
             // Draw row drop highlight when dragging a Y row over another row
             if let (Some((source_row, _)), Some(ptr)) =
                 (&self.row_drag_source, pointer_mm)
@@ -1728,6 +1759,7 @@ impl eframe::App for CanvasApp {
                 if ui.button("Clear connections").clicked() {
                     self.connections.clear();
                     self.connection_drag_source = None;
+                    self.connection_error_preview = None;
                     self.row_drag_source = None;
                     self.annotation_drag_source = None;
                     self.net_row_pins.clear();

@@ -1369,6 +1369,27 @@ pub fn draw_connection_drag_line(
     );
 }
 
+/// Line between two pads (e.g. red preview when a connection cannot be routed).
+pub fn draw_pad_to_pad_line(
+    config: &ProtomatrixConfig,
+    painter: &egui::Painter,
+    to_screen: &impl Fn(f32, f32) -> egui::Pos2,
+    scale: f32,
+    a: &ProtomatrixTarget,
+    b: &ProtomatrixTarget,
+    color: egui::Color32,
+) {
+    let Some((ax, ay)) = target_to_mm(config, a) else {
+        return;
+    };
+    let Some((bx, by)) = target_to_mm(config, b) else {
+        return;
+    };
+    let stroke_w = config.track_width_mm * scale * 1.2;
+    let stroke = egui::Stroke::new(stroke_w, color);
+    painter.line_segment([to_screen(ax, ay), to_screen(bx, by)], stroke);
+}
+
 /// Result of pointer input handling: what's under the cursor and what was clicked.
 #[derive(Clone, Debug, Default)]
 pub struct ProtomatrixPointerState {
